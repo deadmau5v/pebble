@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
@@ -87,6 +88,16 @@ type Settings struct {
 	// out a large chunk of dirty filesystem buffers.
 	BytesPerSync int
 
+	// Local contains fields that are only relevant for files stored on the local
+	// filesystem.
+	Local struct {
+		// TODO(radu): move FSCleaner, NoSyncOnClose, BytesPerSync here.
+
+		// ReadaheadConfig is used to retrieve the current readahead mode; it is
+		// consulted whenever a read handle is initialized.
+		ReadaheadConfig *ReadaheadConfig
+	}
+
 	// Fields here are set only if the provider is to support remote objects
 	// (experimental).
 	Remote struct {
@@ -124,6 +135,70 @@ type Settings struct {
 	}
 }
 
+// ReadaheadConfig is a container for the settings that control the use of
+// read-ahead.
+//
+// It stores two ReadaheadModes:
+//   - Informed is the type of read-ahead for operations that are known to read a
+//     large consecutive chunk of a file.
+//   - Speculative is the type of read-ahead used automatically, when consecutive
+//     reads are detected.
+//
+// The settings can be changed and read atomically.
+type ReadaheadConfig struct {
+	value atomic.Uint32
+}
+
+// These are the default readahead modes when a config is not specified.
+const (
+	defaultReadaheadInformed    = FadviseSequential
+	defaultReadaheadSpeculative = FadviseSequential
+)
+
+// NewReadaheadConfig returns a new readahead config container initialized with
+// default values.
+func NewReadaheadConfig() *ReadaheadConfig {
+	rc := &ReadaheadConfig{}
+	rc.Set(defaultReadaheadInformed, defaultReadaheadSpeculative)
+	return rc
+}
+
+// Set the informed and speculative readahead modes.
+func (rc *ReadaheadConfig) Set(informed, speculative ReadaheadMode) {
+	rc.value.Store(uint32(speculative)<<8 | uint32(informed))
+}
+
+// Informed returns the type of read-ahead for operations that are known to read
+// a large consecutive chunk of a file.
+func (rc *ReadaheadConfig) Informed() ReadaheadMode {
+	return ReadaheadMode(rc.value.Load() & 0xff)
+}
+
+// Speculative returns the type of read-ahead used automatically, when
+// consecutive reads are detected.
+func (rc *ReadaheadConfig) Speculative() ReadaheadMode {
+	return ReadaheadMode(rc.value.Load() >> 8)
+}
+
+// ReadaheadMode indicates the type of read-ahead to use, either for informed
+// read-ahead (e.g. compactions) or speculative read-ahead.
+type ReadaheadMode uint8
+
+const (
+	// NoReadahead disables readahead altogether.
+	NoReadahead ReadaheadMode = iota
+
+	// SysReadahead enables the use of SYS_READAHEAD call to prefetch data.
+	// The prefetch window grows dynamically as consecutive writes are detected.
+	SysReadahead
+
+	// FadviseSequential enables the use of FADV_SEQUENTIAL. For informed
+	// read-ahead, FADV_SEQUENTIAL is used from the beginning. For speculative
+	// read-ahead, SYS_READAHEAD is first used until the window reaches the
+	// maximum size, then we switch to FADV_SEQUENTIAL.
+	FadviseSequential
+)
+
 // DefaultSettings initializes default settings (with no remote storage),
 // suitable for tests and tools.
 func DefaultSettings(fs vfs.FS, dirName string) Settings {
@@ -159,6 +234,10 @@ func open(settings Settings) (p *provider, _ error) {
 			fsDir.Close()
 		}
 	}()
+
+	if settings.Local.ReadaheadConfig == nil {
+		settings.Local.ReadaheadConfig = NewReadaheadConfig()
+	}
 
 	p = &provider{
 		st:    settings,

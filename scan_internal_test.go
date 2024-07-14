@@ -217,7 +217,7 @@ func TestScanInternal(t *testing.T) {
 			categoryAndQoS sstable.CategoryAndQoS,
 			lower, upper []byte,
 			visitPointKey func(key *InternalKey, value LazyValue, iterInfo IteratorLevel) error,
-			visitRangeDel func(start, end []byte, seqNum uint64) error,
+			visitRangeDel func(start, end []byte, seqNum base.SeqNum) error,
 			visitRangeKey func(start, end []byte, keys []keyspan.Key) error,
 			visitSharedFile func(sst *SharedSSTMeta) error,
 			visitExternalFile func(sst *ExternalFile) error,
@@ -416,7 +416,7 @@ func TestScanInternal(t *testing.T) {
 						require.NoError(t, w.DeleteRange(span.Start, span.End))
 					}
 					require.NoError(t, err)
-					require.NoError(t, rangeDels.Close())
+					rangeDels.Close()
 				}
 				{
 					span, err := rangeKeys.First()
@@ -432,7 +432,7 @@ func TestScanInternal(t *testing.T) {
 					}
 					require.NoError(t, err)
 				}
-				require.NoError(t, rangeKeys.Close())
+				rangeKeys.Close()
 				for kv := points.First(); kv != nil; kv = points.Next() {
 					t.Logf("writing %s", kv.K)
 					var value []byte
@@ -565,7 +565,7 @@ func TestScanInternal(t *testing.T) {
 					fmt.Fprintf(&b, "%s (%s)\n", key, v)
 					return nil
 				},
-				func(start, end []byte, seqNum uint64) error {
+				func(start, end []byte, seqNum base.SeqNum) error {
 					fmt.Fprintf(&b, "%s-%s#%d,RANGEDEL\n", start, end, seqNum)
 					return nil
 				},

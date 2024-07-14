@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"runtime/pprof"
 	"slices"
@@ -21,7 +20,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/private"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/objstorage/remote"
@@ -77,9 +76,7 @@ type noCloseIter struct {
 	keyspan.FragmentIterator
 }
 
-func (i noCloseIter) Close() error {
-	return nil
-}
+func (i *noCloseIter) Close() {}
 
 type compactionLevel struct {
 	level int
@@ -228,10 +225,10 @@ type compaction struct {
 	smallest InternalKey
 	largest  InternalKey
 
-	// A list of objects to close when the compaction finishes. Used by input
-	// iteration to keep rangeDelIters open for the lifetime of the compaction,
-	// and only close them when the compaction finishes.
-	closers []io.Closer
+	// A list of fragment iterators to close when the compaction finishes. Used by
+	// input iteration to keep rangeDelIters open for the lifetime of the
+	// compaction, and only close them when the compaction finishes.
+	closers []*noCloseIter
 
 	// grandparents are the tables in level+2 that overlap with the files being
 	// compacted. Used to determine output table boundaries. Do not assume that the actual files
@@ -258,8 +255,8 @@ type compaction struct {
 
 // inputLargestSeqNumAbsolute returns the maximum LargestSeqNumAbsolute of any
 // input sstables.
-func (c *compaction) inputLargestSeqNumAbsolute() uint64 {
-	var seqNum uint64
+func (c *compaction) inputLargestSeqNumAbsolute() base.SeqNum {
+	var seqNum base.SeqNum
 	for _, cl := range c.inputs {
 		cl.files.Each(func(m *manifest.FileMetadata) {
 			seqNum = max(seqNum, m.LargestSeqNumAbsolute)
@@ -788,8 +785,7 @@ func (c *compaction) newInputIters(
 			// mergingIter.
 			iter := level.files.Iter()
 			for f := iter.First(); f != nil; f = iter.Next() {
-				rangeDelIter, closer, err := c.newRangeDelIter(
-					newIters, iter.Take(), iterOpts, l)
+				rangeDelIter, err := c.newRangeDelIter(newIters, iter.Take(), iterOpts, l)
 				if err != nil {
 					// The error will already be annotated with the BackingFileNum, so
 					// we annotate it with the FileNum.
@@ -799,7 +795,7 @@ func (c *compaction) newInputIters(
 					continue
 				}
 				rangeDelIters = append(rangeDelIters, rangeDelIter)
-				c.closers = append(c.closers, closer)
+				c.closers = append(c.closers, rangeDelIter)
 			}
 
 			// Check if this level has any range keys.
@@ -813,25 +809,25 @@ func (c *compaction) newInputIters(
 			if hasRangeKeys {
 				li := &keyspanimpl.LevelIter{}
 				newRangeKeyIterWrapper := func(file *manifest.FileMetadata, iterOptions keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
-					iter, err := newRangeKeyIter(file, iterOptions)
+					rangeKeyIter, err := newRangeKeyIter(file, iterOptions)
 					if err != nil {
 						return nil, err
-					} else if iter == nil {
+					} else if rangeKeyIter == nil {
 						return emptyKeyspanIter, nil
 					}
 					// Ensure that the range key iter is not closed until the compaction is
 					// finished. This is necessary because range key processing
 					// requires the range keys to be held in memory for up to the
 					// lifetime of the compaction.
-					c.closers = append(c.closers, iter)
-					iter = noCloseIter{iter}
+					noCloseIter := &noCloseIter{rangeKeyIter}
+					c.closers = append(c.closers, noCloseIter)
 
 					// We do not need to truncate range keys to sstable boundaries, or
 					// only read within the file's atomic compaction units, unlike with
 					// range tombstones. This is because range keys were added after we
 					// stopped splitting user keys across sstables, so all the range keys
 					// in this sstable must wholly lie within the file's bounds.
-					return iter, err
+					return noCloseIter, err
 				}
 				li.Init(keyspan.SpanIterOptions{}, c.cmp, newRangeKeyIterWrapper, level.files.Iter(), l, manifest.KeyTypeRange)
 				rangeKeyIters = append(rangeKeyIters, li)
@@ -902,7 +898,7 @@ func (c *compaction) newInputIters(
 
 func (c *compaction) newRangeDelIter(
 	newIters tableNewIters, f manifest.LevelFile, opts IterOptions, l manifest.Level,
-) (keyspan.FragmentIterator, io.Closer, error) {
+) (*noCloseIter, error) {
 	opts.level = l
 	iterSet, err := newIters(context.Background(), f.FileMetadata, &opts,
 		internalIterOpts{
@@ -910,16 +906,16 @@ func (c *compaction) newRangeDelIter(
 			bufferPool: &c.bufferPool,
 		}, iterRangeDeletions)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	} else if iterSet.rangeDeletion == nil {
 		// The file doesn't contain any range deletions.
-		return nil, nil, nil
+		return nil, nil
 	}
 	// Ensure that rangeDelIter is not closed until the compaction is
 	// finished. This is necessary because range tombstone processing
 	// requires the range tombstones to be held in memory for up to the
 	// lifetime of the compaction.
-	return noCloseIter{iterSet.rangeDeletion}, iterSet.rangeDeletion, nil
+	return &noCloseIter{iterSet.rangeDeletion}, nil
 }
 
 func (c *compaction) String() string {
@@ -1244,9 +1240,14 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 			ingestFlushable.exciseSpan.Contains(d.cmp, file.FileMetadata.Largest) {
 			level = 6
 		} else {
-			var err error
-			level, fileToSplit, err = ingestTargetLevel(ctx, overlapChecker,
-				baseLevel, d.mu.compact.inProgress, file.FileMetadata, suggestSplit)
+			// TODO(radu): this can perform I/O; we should not do this while holding DB.mu.
+			lsmOverlap, err := overlapChecker.DetermineLSMOverlap(ctx, file.UserKeyBounds())
+			if err != nil {
+				return nil, err
+			}
+			level, fileToSplit, err = ingestTargetLevel(
+				ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, file.FileMetadata, suggestSplit,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -1584,7 +1585,7 @@ func (d *DB) maybeTransitionSnapshotsToFileOnlyLocked() {
 			continue
 		}
 		overlapsFlushable := false
-		if base.Visible(earliestUnflushedSeqNum, s.efos.seqNum, InternalKeySeqNumMax) {
+		if base.Visible(earliestUnflushedSeqNum, s.efos.seqNum, base.SeqNumMax) {
 			// There are some unflushed keys that are still visible to the EFOS.
 			// Check if any memtables older than the EFOS contain keys within a
 			// protected range of the EFOS. If no, we can transition.
@@ -1593,7 +1594,7 @@ func (d *DB) maybeTransitionSnapshotsToFileOnlyLocked() {
 				protectedRanges[i] = s.efos.protectedRanges[i]
 			}
 			for i := range d.mu.mem.queue {
-				if !base.Visible(d.mu.mem.queue[i].logSeqNum, s.efos.seqNum, InternalKeySeqNumMax) {
+				if !base.Visible(d.mu.mem.queue[i].logSeqNum, s.efos.seqNum, base.SeqNumMax) {
 					// All keys in this memtable are newer than the EFOS. Skip this
 					// memtable.
 					continue
@@ -1888,15 +1889,15 @@ type deleteCompactionHint struct {
 	// tombstone smallest sequence number to be deleted. All of a tables'
 	// sequence numbers must fall into the same snapshot stripe as the
 	// tombstone largest sequence number to be deleted.
-	tombstoneLargestSeqNum  uint64
-	tombstoneSmallestSeqNum uint64
+	tombstoneLargestSeqNum  base.SeqNum
+	tombstoneSmallestSeqNum base.SeqNum
 	// The smallest sequence number of a sstable that was found to be covered
 	// by this hint. The hint cannot be resolved until this sequence number is
 	// in the same snapshot stripe as the largest tombstone sequence number.
 	// This is set when a hint is created, so the LSM may look different and
 	// notably no longer contain the sstable that contained the key at this
 	// sequence number.
-	fileSmallestSeqNum uint64
+	fileSmallestSeqNum base.SeqNum
 }
 
 func (h deleteCompactionHint) String() string {
@@ -2492,7 +2493,7 @@ func (d *DB) compactAndWrite(
 	pointIter, rangeDelIter, rangeKeyIter, err := c.newInputIters(d.newIters, d.tableNewRangeKeyIter)
 	defer func() {
 		for _, closer := range c.closers {
-			result.Err = firstError(result.Err, closer.Close())
+			closer.FragmentIterator.Close()
 		}
 	}()
 	if err != nil {
@@ -2711,7 +2712,13 @@ func (d *DB) newCompactionOutput(
 		FileNum: diskFileNum,
 	})
 
-	cacheOpts := private.SSTableCacheOpts(d.cacheID, diskFileNum).(sstable.WriterOption)
+	writerOpts.SetInternal(sstableinternal.WriterOptions{
+		CacheOpts: sstableinternal.CacheOptions{
+			Cache:   d.opts.Cache,
+			CacheID: d.cacheID,
+			FileNum: diskFileNum,
+		},
+	})
 
 	const MaxFileWriteAdditionalCPUTime = time.Millisecond * 100
 	cpuWorkHandle := d.opts.Experimental.CPUWorkPermissionGranter.GetPermission(
@@ -2721,7 +2728,7 @@ func (d *DB) newCompactionOutput(
 		d.opts.Experimental.MaxWriterConcurrency > 0 &&
 			(cpuWorkHandle.Permitted() || d.opts.Experimental.ForceWriterParallelism)
 
-	tw := sstable.NewWriter(writable, writerOpts, cacheOpts)
+	tw := sstable.NewWriter(writable, writerOpts)
 	return objMeta, tw, cpuWorkHandle, nil
 }
 

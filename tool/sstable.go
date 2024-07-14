@@ -17,8 +17,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
@@ -146,13 +146,19 @@ func (s *sstableT) newReader(f vfs.File) (*sstable.Reader, error) {
 		return nil, err
 	}
 	o := sstable.ReaderOptions{
-		Cache:    pebble.NewCache(128 << 20 /* 128 MB */),
-		Comparer: s.opts.Comparer,
-		Filters:  s.opts.Filters,
+		Comparer:  s.opts.Comparer,
+		Filters:   s.opts.Filters,
+		Mergers:   s.mergers,
+		Comparers: s.comparers,
 	}
-	defer o.Cache.Unref()
-	return sstable.NewReader(readable, o, s.comparers, s.mergers,
-		private.SSTableRawTombstonesOpt.(sstable.ReaderOption))
+	c := pebble.NewCache(128 << 20 /* 128 MB */)
+	defer c.Unref()
+	o.SetInternal(sstableinternal.ReaderOptions{
+		CacheOpts: sstableinternal.CacheOptions{
+			Cache: c,
+		},
+	})
+	return sstable.NewReader(readable, o)
 }
 
 func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
@@ -387,7 +393,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		// bit more work here to put them in a form that can be iterated in
 		// parallel with the point records.
 		rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
-			iter, err := r.NewRawRangeDelIter(sstable.NoTransforms)
+			iter, err := r.NewRawRangeDelIter(sstable.NoFragmentTransforms)
 			if err != nil {
 				return nil, err
 			}
@@ -407,7 +413,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 					// The range tombstone lies before the scan range.
 					continue
 				}
-				tombstones = append(tombstones, t.ShallowClone())
+				tombstones = append(tombstones, t.Clone())
 			}
 			if err != nil {
 				return nil, err
@@ -489,7 +495,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 
 		// Handle range keys.
-		rkIter, err := r.NewRawRangeKeyIter(sstable.NoTransforms)
+		rkIter, err := r.NewRawRangeKeyIter(sstable.NoFragmentTransforms)
 		if err != nil {
 			fmt.Fprintf(stdout, "%s\n", err)
 			os.Exit(1)

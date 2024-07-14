@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
@@ -90,7 +91,11 @@ func TestLevelIter(t *testing.T) {
 			iter := newLevelIter(context.Background(), opts, testkeys.Comparer, newIters, files.Iter(), manifest.Level(level), internalIterOpts{})
 			defer iter.Close()
 			// Fake up the range deletion initialization.
-			iter.initRangeDel(new(keyspan.FragmentIterator))
+			iter.initRangeDel(func(rangeDelIter keyspan.FragmentIterator) {
+				if rangeDelIter != nil {
+					rangeDelIter.Close()
+				}
+			})
 			iter.disableInvariants = true
 			return itertest.RunInternalIterCmd(t, d, iter, itertest.Verbose)
 
@@ -177,7 +182,7 @@ func (lt *levelIterTest) newIters(
 		set.point = iter
 	}
 	if kinds.RangeDeletion() {
-		rangeDelIter, err := lt.readers[file.FileNum].NewRawRangeDelIter(transforms)
+		rangeDelIter, err := lt.readers[file.FileNum].NewRawRangeDelIter(file.FragmentIterTransforms())
 		if err != nil {
 			return iterSet{}, errors.CombineErrors(err, set.CloseAll())
 		}
@@ -334,7 +339,11 @@ func TestLevelIterBoundaries(t *testing.T) {
 				slice := manifest.NewLevelSliceKeySorted(lt.cmp.Compare, lt.metas)
 				iter = newLevelIter(context.Background(), IterOptions{}, testkeys.Comparer, lt.newIters, slice.Iter(), manifest.Level(level), internalIterOpts{})
 				// Fake up the range deletion initialization.
-				iter.initRangeDel(new(keyspan.FragmentIterator))
+				iter.initRangeDel(func(rangeDelIter keyspan.FragmentIterator) {
+					if rangeDelIter != nil {
+						rangeDelIter.Close()
+					}
+				})
 			}
 			if !save {
 				defer func() {
@@ -407,6 +416,14 @@ func (i *levelIterTestIter) rangeDelSeek(
 	return kv
 }
 
+func (i *levelIterTestIter) Close() error {
+	if i.rangeDelIter != nil {
+		i.rangeDelIter.Close()
+		i.rangeDelIter = nil
+	}
+	return i.levelIter.Close()
+}
+
 func (i *levelIterTestIter) String() string {
 	return "level-iter-test"
 }
@@ -457,7 +474,12 @@ func TestLevelIterSeek(t *testing.T) {
 			iter.init(context.Background(), IterOptions{}, testkeys.Comparer, lt.newIters, slice.Iter(),
 				manifest.Level(level), internalIterOpts{stats: &stats})
 			defer iter.Close()
-			iter.initRangeDel(&iter.rangeDelIter)
+			iter.initRangeDel(func(rangeDelIter keyspan.FragmentIterator) {
+				if iter.rangeDelIter != nil {
+					iter.rangeDelIter.Close()
+				}
+				iter.rangeDelIter = rangeDelIter
+			})
 			return itertest.RunInternalIterCmd(t, d, iter, itertest.Verbose, itertest.WithSpan(iter.getRangeDel), itertest.WithStats(&stats))
 
 		case "iters-created":
@@ -504,9 +526,12 @@ func buildLevelIterTables(
 			b.Fatal(err)
 		}
 	}
-
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20), Comparer: DefaultComparer}
-	defer opts.Cache.Unref()
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
+	opts := sstable.ReaderOptions{Comparer: DefaultComparer}
+	opts.SetInternalCacheOpts(sstableinternal.CacheOptions{
+		Cache: c,
+	})
 	readers := make([]*sstable.Reader, len(files))
 	for i := range files {
 		f, err := mem.Open(fmt.Sprintf("bench%d", i))
@@ -607,7 +632,11 @@ func BenchmarkLevelIterSeqSeekGEWithBounds(b *testing.B) {
 							l := newLevelIter(context.Background(), IterOptions{}, DefaultComparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 							// Fake up the range deletion initialization, to resemble the usage
 							// in a mergingIter.
-							l.initRangeDel(new(keyspan.FragmentIterator))
+							l.initRangeDel(func(rangeDelIter keyspan.FragmentIterator) {
+								if rangeDelIter != nil {
+									rangeDelIter.Close()
+								}
+							})
 							keyCount := len(keys)
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
@@ -655,7 +684,11 @@ func BenchmarkLevelIterSeqSeekPrefixGE(b *testing.B) {
 					l := newLevelIter(context.Background(), IterOptions{}, testkeys.Comparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 					// Fake up the range deletion initialization, to resemble the usage
 					// in a mergingIter.
-					l.initRangeDel(new(keyspan.FragmentIterator))
+					l.initRangeDel(func(rangeDelIter keyspan.FragmentIterator) {
+						if rangeDelIter != nil {
+							rangeDelIter.Close()
+						}
+					})
 					keyCount := len(keys)
 					pos := 0
 					l.SeekPrefixGE(keys[pos], keys[pos], base.SeekGEFlagsNone)

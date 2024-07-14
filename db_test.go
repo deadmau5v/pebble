@@ -10,15 +10,18 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/fifo"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
@@ -381,7 +384,7 @@ func TestLargeBatch(t *testing.T) {
 		require.NoError(t, err)
 		return logs[len(logs)-1]
 	}
-	memTableCreationSeqNum := func() uint64 {
+	memTableCreationSeqNum := func() base.SeqNum {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		return d.mu.mem.mutable.logSeqNum
@@ -1434,7 +1437,7 @@ func TestTracing(t *testing.T) {
 	_, closer, err := d.Get([]byte("hello"))
 	require.NoError(t, err)
 	closer.Close()
-	readerInitTraceString := "reading 37 bytes took 5ms\nreading 419 bytes took 5ms\n"
+	readerInitTraceString := "reading 53 bytes took 5ms\nreading 37 bytes took 5ms\nreading 419 bytes took 5ms\n"
 	iterTraceString := "reading 27 bytes took 5ms\nreading 29 bytes took 5ms\n"
 	require.Equal(t, readerInitTraceString+iterTraceString, tracer.buf.String())
 
@@ -2211,7 +2214,8 @@ func TestDeterminism(t *testing.T) {
 						if cmdArg.Key == "io-latency" {
 							prevMkfs := mkfs
 							mkfs = func() vfs.FS {
-								return errorfs.Wrap(prevMkfs(), errorfs.RandomLatency(errorfs.Randomly(p, 0), mean, 0))
+								return errorfs.Wrap(prevMkfs(), errorfs.RandomLatency(
+									errorfs.Randomly(p, 0), mean, 0 /* seed */, 0 /* no limit */))
 							}
 						} else if cmdArg.Key == "step-latency" {
 							beforeStep = func() {
@@ -2338,5 +2342,106 @@ func parseOrderingTokens(tokens []string) (orderingNode, int) {
 			panic(err)
 		}
 		return leaf(v), 1
+	}
+}
+
+type readTrackFS struct {
+	vfs.FS
+
+	currReadCount atomic.Int32
+	maxReadCount  atomic.Int32
+}
+
+type readTrackFile struct {
+	vfs.File
+	fs *readTrackFS
+}
+
+func (fs *readTrackFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	file, err := fs.FS.Open(name, opts...)
+	if err != nil || !strings.HasSuffix(name, ".sst") {
+		return file, err
+	}
+	return &readTrackFile{
+		File: file,
+		fs:   fs,
+	}, nil
+}
+
+func (f *readTrackFile) ReadAt(p []byte, off int64) (n int, err error) {
+	val := f.fs.currReadCount.Add(1)
+	defer f.fs.currReadCount.Add(-1)
+	for maxVal := f.fs.maxReadCount.Load(); val > maxVal; maxVal = f.fs.maxReadCount.Load() {
+		if f.fs.maxReadCount.CompareAndSwap(maxVal, val) {
+			break
+		}
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func TestLoadBlockSema(t *testing.T) {
+	fs := &readTrackFS{FS: vfs.NewMem()}
+	sema := fifo.NewSemaphore(100)
+	db, err := Open("", testingRandomized(t, &Options{
+		Cache:         cache.New(1),
+		FS:            fs,
+		LoadBlockSema: sema,
+	}))
+	require.NoError(t, err)
+
+	key := func(i, j int) []byte {
+		return []byte(fmt.Sprintf("%02d/%02d", i, j))
+	}
+
+	// Create 20 regions and compact them separately, so we end up with 20
+	// disjoint tables.
+	const numRegions = 20
+	const numKeys = 20
+	for i := 0; i < numRegions; i++ {
+		for j := 0; j < numKeys; j++ {
+			require.NoError(t, db.Set(key(i, j), []byte("value"), nil))
+		}
+		require.NoError(t, db.Compact(key(i, 0), key(i, numKeys-1), false))
+	}
+
+	// Read all regions to warm up the table cache.
+	for i := 0; i < numRegions; i++ {
+		val, closer, err := db.Get(key(i, 1))
+		require.NoError(t, err)
+		require.Equal(t, []byte("value"), val)
+		if closer != nil {
+			closer.Close()
+		}
+	}
+
+	for _, n := range []int64{1, 2, 4} {
+		t.Run(fmt.Sprintf("%d", n), func(t *testing.T) {
+			sema.UpdateCapacity(n)
+			fs.maxReadCount.Store(0)
+			var wg sync.WaitGroup
+			// Spin up workers that perform random reads.
+			const numWorkers = 20
+			for i := 0; i < numWorkers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					const numQueries = 100
+					for i := 0; i < numQueries; i++ {
+						val, closer, err := db.Get(key(rand.Intn(numRegions), rand.Intn(numKeys)))
+						require.NoError(t, err)
+						require.Equal(t, []byte("value"), val)
+						if closer != nil {
+							closer.Close()
+						}
+						runtime.Gosched()
+					}
+				}()
+			}
+			wg.Wait()
+			// Verify the maximum read count did not exceed the limit.
+			maxReadCount := fs.maxReadCount.Load()
+			require.Greater(t, maxReadCount, int32(0))
+			require.LessOrEqual(t, maxReadCount, int32(n))
+		})
 	}
 }

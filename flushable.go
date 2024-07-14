@@ -7,7 +7,6 @@ package pebble
 import (
 	"context"
 	"fmt"
-	"io"
 	"sync/atomic"
 	"time"
 
@@ -86,7 +85,7 @@ type flushableEntry struct {
 	logSize uint64
 	// The current logSeqNum at the time the memtable was created. This is
 	// guaranteed to be less than or equal to any seqnum stored in the memtable.
-	logSeqNum uint64
+	logSeqNum base.SeqNum
 	// readerRefs tracks the read references on the flushable. The two sources of
 	// reader references are DB.mu.mem.queue and readState.memtables. The memory
 	// reserved by the flushable in the cache is released when the reader refs
@@ -347,9 +346,9 @@ func computePossibleOverlapsGenericImpl[F flushable](
 ) {
 	iter := f.newIter(nil)
 	rangeDelIter := f.newRangeDelIter(nil)
-	rkeyIter := f.newRangeKeyIter(nil)
+	rangeKeyIter := f.newRangeKeyIter(nil)
 	for _, b := range bounded {
-		overlap, err := determineOverlapAllIters(cmp, b.UserKeyBounds(), iter, rangeDelIter, rkeyIter)
+		overlap, err := determineOverlapAllIters(cmp, b.UserKeyBounds(), iter, rangeDelIter, rangeKeyIter)
 		if invariants.Enabled && err != nil {
 			panic(errors.AssertionFailedf("expected iterator to be infallible: %v", err))
 		}
@@ -360,14 +359,18 @@ func computePossibleOverlapsGenericImpl[F flushable](
 		}
 	}
 
-	for _, c := range [3]io.Closer{iter, rangeDelIter, rkeyIter} {
-		if c != nil {
-			if err := c.Close(); err != nil {
-				// This implementation must be used in circumstances where
-				// reading through the iterator is infallible.
-				panic(err)
-			}
+	if iter != nil {
+		if err := iter.Close(); err != nil {
+			// This implementation must be used in circumstances where
+			// reading through the iterator is infallible.
+			panic(err)
 		}
+	}
+	if rangeDelIter != nil {
+		rangeDelIter.Close()
+	}
+	if rangeKeyIter != nil {
+		rangeKeyIter.Close()
 	}
 }
 
@@ -393,4 +396,34 @@ func determineOverlapAllIters(
 		return determineOverlapKeyspanIterator(cmp, bounds, rangeKeyIter)
 	}
 	return false, nil
+}
+
+func determineOverlapPointIterator(
+	cmp base.Compare, bounds base.UserKeyBounds, iter internalIterator,
+) (bool, error) {
+	kv := iter.SeekGE(bounds.Start, base.SeekGEFlagsNone)
+	if kv == nil {
+		return false, iter.Error()
+	}
+	return bounds.End.IsUpperBoundForInternalKey(cmp, kv.K), nil
+}
+
+func determineOverlapKeyspanIterator(
+	cmp base.Compare, bounds base.UserKeyBounds, iter keyspan.FragmentIterator,
+) (bool, error) {
+	// NB: The spans surfaced by the fragment iterator are non-overlapping.
+	span, err := iter.SeekGE(bounds.Start)
+	if err != nil {
+		return false, err
+	}
+	for ; span != nil; span, err = iter.Next() {
+		if !bounds.End.IsUpperBoundFor(cmp, span.Start) {
+			// The span starts after our bounds.
+			return false, nil
+		}
+		if !span.Empty() {
+			return true, nil
+		}
+	}
+	return false, err
 }

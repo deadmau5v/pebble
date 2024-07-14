@@ -819,8 +819,8 @@ func propArgs(props []props, getProp func(*props) interface{}) []interface{} {
 
 type props struct {
 	Count                      uint64
-	SmallestSeqNum             uint64
-	LargestSeqNum              uint64
+	SmallestSeqNum             base.SeqNum
+	LargestSeqNum              base.SeqNum
 	DataSize                   uint64
 	FilterSize                 uint64
 	IndexSize                  uint64
@@ -883,7 +883,10 @@ func (d *dbT) addProps(
 	if err != nil {
 		return err
 	}
-	r, err := sstable.NewReader(f, sstable.ReaderOptions{}, d.mergers, d.comparers)
+	r, err := sstable.NewReader(f, sstable.ReaderOptions{
+		Mergers:   d.mergers,
+		Comparers: d.comparers,
+	})
 	if err != nil {
 		_ = f.Close()
 		return err

@@ -126,26 +126,13 @@ var twoLevelIterPool = sync.Pool{
 	},
 }
 
-// TODO(jackson): rangedel fragmentBlockIters can't be pooled because of some
-// code paths that double Close the iters. Fix the double close and pool the
-// *fragmentBlockIter type directly.
-
-var rangeKeyFragmentBlockIterPool = sync.Pool{
-	New: func() interface{} {
-		i := &rangeKeyFragmentBlockIter{}
-		// Note: this is a no-op if invariants are disabled or race is enabled.
-		invariants.SetFinalizer(i, checkRangeKeyFragmentBlockIterator)
-		return i
-	},
-}
-
 func checkSingleLevelIterator(obj interface{}) {
 	i := obj.(*singleLevelIterator)
-	if p := i.data.handle.Get(); p != nil {
+	if p := i.data.Handle().Get(); p != nil {
 		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %p\n", p)
 		os.Exit(1)
 	}
-	if p := i.index.handle.Get(); p != nil {
+	if p := i.index.Handle().Get(); p != nil {
 		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %p\n", p)
 		os.Exit(1)
 	}
@@ -153,20 +140,12 @@ func checkSingleLevelIterator(obj interface{}) {
 
 func checkTwoLevelIterator(obj interface{}) {
 	i := obj.(*twoLevelIterator)
-	if p := i.data.handle.Get(); p != nil {
+	if p := i.data.Handle().Get(); p != nil {
 		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %p\n", p)
 		os.Exit(1)
 	}
-	if p := i.index.handle.Get(); p != nil {
+	if p := i.index.Handle().Get(); p != nil {
 		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-}
-
-func checkRangeKeyFragmentBlockIterator(obj interface{}) {
-	i := obj.(*rangeKeyFragmentBlockIter)
-	if p := i.blockIter.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "fragmentBlockIter.blockIter.handle is not nil: %p\n", p)
 		os.Exit(1)
 	}
 }
@@ -184,7 +163,7 @@ func (i *compactionIterator) String() string {
 	if i.vState != nil {
 		return i.vState.fileNum.String()
 	}
-	return i.reader.fileNum.String()
+	return i.reader.cacheOpts.FileNum.String()
 }
 
 func (i *compactionIterator) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {

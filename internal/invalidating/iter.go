@@ -8,17 +8,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/fastrand"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // MaybeWrapIfInvariants wraps some iterators with an invalidating iterator.
 // MaybeWrapIfInvariants does nothing in non-invariant builds.
 func MaybeWrapIfInvariants(iter base.InternalIterator) base.InternalIterator {
-	if invariants.Enabled {
-		if fastrand.Uint32n(10) == 1 {
-			return NewIter(iter)
-		}
+	if invariants.Sometimes(10) {
+		return NewIter(iter)
 	}
 	return iter
 }
@@ -160,6 +158,14 @@ func (i *iter) SetBounds(lower, upper []byte) {
 
 func (i *iter) SetContext(ctx context.Context) {
 	i.iter.SetContext(ctx)
+}
+
+// DebugTree is part of the InternalIterator interface.
+func (i *iter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", i, i)
+	if i.iter != nil {
+		i.iter.DebugTree(n)
+	}
 }
 
 func (i *iter) String() string {

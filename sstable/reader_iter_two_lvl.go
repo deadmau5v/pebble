@@ -11,14 +11,15 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
-	"github.com/cockroachdb/pebble/objstorage"
-	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
 type twoLevelIterator struct {
 	singleLevelIterator
-	topLevelIndex blockIter
+	topLevelIndex rowblk.Iter
 }
 
 // twoLevelIterator implements the base.InternalIterator interface.
@@ -31,17 +32,15 @@ var _ base.InternalIterator = (*twoLevelIterator)(nil)
 func (i *twoLevelIterator) loadIndex(dir int8) loadBlockResult {
 	// Ensure the index data block iterators are invalidated even if loading of
 	// the index fails.
-	i.data.invalidate()
-	i.index.invalidate()
-	if !i.topLevelIndex.valid() {
-		i.index.offset = 0
-		i.index.restarts = 0
+	i.data.Invalidate()
+	i.index.Invalidate()
+	if !i.topLevelIndex.Valid() {
 		return loadBlockFailed
 	}
-	v := i.topLevelIndex.value()
+	v := i.topLevelIndex.Value()
 	bhp, err := decodeBlockHandleWithProperties(v.InPlaceValue())
 	if err != nil {
-		i.err = base.CorruptionErrorf("pebble/table: corrupt top level index entry")
+		i.err = base.CorruptionErrorf("pebble/table: corrupt top level index entry (%v)", err)
 		return loadBlockFailed
 	}
 	if i.bpfs != nil {
@@ -60,21 +59,21 @@ func (i *twoLevelIterator) loadIndex(dir int8) loadBlockResult {
 	}
 	ctx := objiotracing.WithBlockType(i.ctx, objiotracing.MetadataBlock)
 	indexBlock, err := i.reader.readBlock(
-		ctx, bhp.BlockHandle, nil /* transform */, i.indexFilterRH, i.stats, &i.iterStats, i.bufferPool)
+		ctx, bhp.Handle, nil /* transform */, i.indexFilterRH, i.stats, &i.iterStats, i.bufferPool)
+	if err == nil {
+		err = i.index.InitHandle(i.cmp, i.reader.Split, indexBlock, i.transforms)
+	}
 	if err != nil {
 		i.err = err
 		return loadBlockFailed
 	}
-	if i.err = i.index.initHandle(i.cmp, i.reader.Split, indexBlock, i.transforms); i.err == nil {
-		return loadBlockOK
-	}
-	return loadBlockFailed
+	return loadBlockOK
 }
 
 // resolveMaybeExcluded is invoked when the block-property filterer has found
 // that an index block is excluded according to its properties but only if its
 // bounds fall within the filter's current bounds. This function consults the
-// apprioriate bound, depending on the iteration direction, and returns either
+// appropriate bound, depending on the iteration direction, and returns either
 // `blockIntersects` or `blockExcluded`.
 func (i *twoLevelIterator) resolveMaybeExcluded(dir int8) intersectsResult {
 	// This iterator is configured with a bound-limited block property filter.
@@ -133,10 +132,13 @@ func (i *twoLevelIterator) resolveMaybeExcluded(dir int8) intersectsResult {
 	return blockIntersects
 }
 
-// Note that lower, upper passed into init has nothing to do with virtual sstable
-// bounds. If the virtualState passed in is not nil, then virtual sstable bounds
-// will be enforced.
-func (i *twoLevelIterator) init(
+// newTwoLevelIterator reads the top-level index block and creates and
+// initializes a two level iterator.
+//
+// Note that lower, upper are iterator bounds and are separate from virtual
+// sstable bounds. If the virtualState passed in is not nil, then virtual
+// sstable bounds will be enforced.
+func newTwoLevelIterator(
 	ctx context.Context,
 	r *Reader,
 	v *virtualState,
@@ -148,65 +150,33 @@ func (i *twoLevelIterator) init(
 	categoryAndQoS CategoryAndQoS,
 	statsCollector *CategoryStatsCollector,
 	rp ReaderProvider,
-	bufferPool *BufferPool,
-) error {
+	bufferPool *block.BufferPool,
+) (*twoLevelIterator, error) {
 	if r.err != nil {
-		return r.err
+		return nil, r.err
 	}
-	i.iterStats.init(categoryAndQoS, statsCollector)
-	i.indexFilterRH = objstorageprovider.UsePreallocatedReadHandle(
-		ctx, r.readable, objstorage.ReadBeforeForIndexAndFilter, &i.indexFilterRHPrealloc)
-	topLevelIndexH, err := r.readIndex(ctx, i.indexFilterRH, stats, &i.iterStats)
-	if err != nil {
-		return err
-	}
-	if v != nil {
-		i.vState = v
-		// Note that upper is exclusive here.
-		i.endKeyInclusive, lower, upper = v.constrainBounds(lower, upper, false /* endInclusive */)
-	}
+	i := twoLevelIterPool.Get().(*twoLevelIterator)
+	i.singleLevelIterator.init(ctx, r, v, transforms, lower, upper, filterer, useFilter,
+		stats, categoryAndQoS, statsCollector, rp, bufferPool)
 
-	i.inPool = false
-	i.ctx = ctx
-	i.lower = lower
-	i.upper = upper
-	i.bpfs = filterer
-	i.useFilter = useFilter
-	i.reader = r
-	i.cmp = r.Compare
-	i.stats = stats
-	i.transforms = transforms
-	i.bufferPool = bufferPool
-	err = i.topLevelIndex.initHandle(i.cmp, i.reader.Split, topLevelIndexH, transforms)
+	topLevelIndexH, err := r.readIndex(ctx, i.indexFilterRH, stats, &i.iterStats)
+	if err == nil {
+		err = i.topLevelIndex.InitHandle(i.cmp, i.reader.Split, topLevelIndexH, transforms)
+	}
 	if err != nil {
-		// blockIter.Close releases topLevelIndexH and always returns a nil error
-		_ = i.topLevelIndex.Close()
-		return err
+		_ = i.Close()
+		return nil, err
 	}
-	i.dataRH = objstorageprovider.UsePreallocatedReadHandle(
-		ctx, r.readable, objstorage.NoReadBefore, &i.dataRHPrealloc)
-	if r.tableFormat >= TableFormatPebblev3 {
-		if r.Properties.NumValueBlocks > 0 {
-			i.vbReader = &valueBlockReader{
-				bpOpen: i,
-				rp:     rp,
-				vbih:   r.valueBIH,
-				stats:  stats,
-			}
-			i.data.lazyValueHandling.vbr = i.vbReader
-			i.vbRH = objstorageprovider.UsePreallocatedReadHandle(
-				ctx, r.readable, objstorage.NoReadBefore, &i.vbRHPrealloc)
-		}
-		i.data.lazyValueHandling.hasValuePrefix = true
-	}
-	return nil
+	return i, nil
 }
 
 func (i *twoLevelIterator) String() string {
-	if i.vState != nil {
-		return i.vState.fileNum.String()
-	}
-	return i.reader.fileNum.String()
+	return i.singleLevelIterator.String()
+}
+
+// DebugTree is part of the InternalIterator interface.
+func (i *twoLevelIterator) DebugTree(tp treeprinter.Node) {
+	tp.Childf("%T(%p) fileNum=%s", i, i, i.String())
 }
 
 // SeekGE implements internalIterator.SeekGE, as documented in the pebble
@@ -231,7 +201,7 @@ func (i *twoLevelIterator) SeekGE(key []byte, flags base.SeekGEFlags) *base.Inte
 	// trySeekUsingNext is true. See the comment about data-exhausted, PGDE, and
 	// bounds-exhausted near the top of the file.
 	if flags.TrySeekUsingNext() &&
-		(i.exhaustedBounds == +1 || (i.data.isDataInvalidated() && i.index.isDataInvalidated())) &&
+		(i.exhaustedBounds == +1 || (i.data.IsDataInvalidated() && i.index.IsDataInvalidated())) &&
 		err == nil {
 		// Already exhausted, so return nil.
 		return nil
@@ -249,7 +219,7 @@ func (i *twoLevelIterator) SeekGE(key []byte, flags base.SeekGEFlags) *base.Inte
 	// block load.
 
 	var dontSeekWithinSingleLevelIter bool
-	if i.topLevelIndex.isDataInvalidated() || !i.topLevelIndex.valid() || i.index.isDataInvalidated() || err != nil ||
+	if i.topLevelIndex.IsDataInvalidated() || !i.topLevelIndex.Valid() || i.index.IsDataInvalidated() || err != nil ||
 		(i.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || i.cmp(key, i.topLevelIndex.Key().UserKey) > 0 {
 		// Slow-path: need to position the topLevelIndex.
 
@@ -259,8 +229,8 @@ func (i *twoLevelIterator) SeekGE(key []byte, flags base.SeekGEFlags) *base.Inte
 		flags = flags.DisableTrySeekUsingNext()
 		var ikv *base.InternalKV
 		if ikv = i.topLevelIndex.SeekGE(key, flags); ikv == nil {
-			i.data.invalidate()
-			i.index.invalidate()
+			i.data.Invalidate()
+			i.index.Invalidate()
 			return nil
 		}
 
@@ -377,7 +347,7 @@ func (i *twoLevelIterator) SeekPrefixGE(
 	filterUsedAndDidNotMatch :=
 		i.reader.tableFilter != nil && i.useFilter && !i.lastBloomFilterMatched
 	if flags.TrySeekUsingNext() && !filterUsedAndDidNotMatch &&
-		(i.exhaustedBounds == +1 || (i.data.isDataInvalidated() && i.index.isDataInvalidated())) &&
+		(i.exhaustedBounds == +1 || (i.data.IsDataInvalidated() && i.index.IsDataInvalidated())) &&
 		err == nil {
 		// Already exhausted, so return nil.
 		return nil
@@ -398,7 +368,7 @@ func (i *twoLevelIterator) SeekPrefixGE(
 			// already loaded block. It was necessary in earlier versions of the code
 			// since the caller was allowed to call Next when SeekPrefixGE returned
 			// nil. This is no longer allowed.
-			i.data.invalidate()
+			i.data.Invalidate()
 			return nil
 		}
 		i.lastBloomFilterMatched = true
@@ -419,7 +389,7 @@ func (i *twoLevelIterator) SeekPrefixGE(
 	// block load.
 
 	var dontSeekWithinSingleLevelIter bool
-	if i.topLevelIndex.isDataInvalidated() || !i.topLevelIndex.valid() || i.index.isDataInvalidated() || err != nil ||
+	if i.topLevelIndex.IsDataInvalidated() || !i.topLevelIndex.Valid() || i.index.IsDataInvalidated() || err != nil ||
 		(i.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || i.cmp(key, i.topLevelIndex.Key().UserKey) > 0 {
 		// Slow-path: need to position the topLevelIndex.
 
@@ -429,8 +399,8 @@ func (i *twoLevelIterator) SeekPrefixGE(
 		flags = flags.DisableTrySeekUsingNext()
 		var ikv *base.InternalKV
 		if ikv = i.topLevelIndex.SeekGE(key, flags); ikv == nil {
-			i.data.invalidate()
-			i.index.invalidate()
+			i.data.Invalidate()
+			i.index.Invalidate()
 			return nil
 		}
 
@@ -608,8 +578,8 @@ func (i *twoLevelIterator) SeekLT(key []byte, flags base.SeekLTFlags) *base.Inte
 	// Intersects=false irrespective of the block props provided) during seeks.
 	if ikv = i.topLevelIndex.SeekGE(key, base.SeekGEFlagsNone); ikv == nil {
 		if ikv = i.topLevelIndex.Last(); ikv == nil {
-			i.data.invalidate()
-			i.index.invalidate()
+			i.data.Invalidate()
+			i.index.Invalidate()
 			return nil
 		}
 
@@ -794,8 +764,8 @@ func (i *twoLevelIterator) NextPrefix(succKey []byte) *base.InternalKV {
 	// slow-path where we seek the iterator.
 	var ikv *base.InternalKV
 	if ikv = i.topLevelIndex.SeekGE(succKey, base.SeekGEFlagsNone); ikv == nil {
-		i.data.invalidate()
-		i.index.invalidate()
+		i.data.Invalidate()
+		i.index.Invalidate()
 		return nil
 	}
 	result := i.loadIndex(+1)
@@ -871,13 +841,13 @@ func (i *twoLevelIterator) skipForward() *base.InternalKV {
 		// guarantees wrt an iterator lower bound when we iterate forward. But we
 		// must never return keys that are not inside the virtual table.
 		useSeek := i.vState != nil &&
-			(!i.topLevelIndex.valid() || base.InternalCompare(i.cmp, i.topLevelIndex.ikv.K, i.vState.lower) < 0)
+			(!i.topLevelIndex.Valid() || base.InternalCompare(i.cmp, *i.topLevelIndex.Key(), i.vState.lower) < 0)
 
 		i.exhaustedBounds = 0
 		topLevelKey := i.topLevelIndex.Next()
 		if topLevelKey == nil {
-			i.data.invalidate()
-			i.index.invalidate()
+			i.data.Invalidate()
+			i.index.Invalidate()
 			return nil
 		}
 		result := i.loadIndex(+1)
@@ -923,8 +893,8 @@ func (i *twoLevelIterator) skipBackward() *base.InternalKV {
 		i.exhaustedBounds = 0
 		topLevelKey := i.topLevelIndex.Prev()
 		if topLevelKey == nil {
-			i.data.invalidate()
-			i.index.invalidate()
+			i.data.Invalidate()
+			i.index.Invalidate()
 			return nil
 		}
 		result := i.loadIndex(-1)
@@ -989,7 +959,7 @@ func (i *twoLevelIterator) Close() error {
 	}
 	*i = twoLevelIterator{
 		singleLevelIterator: i.singleLevelIterator.resetForReuse(),
-		topLevelIndex:       i.topLevelIndex.resetForReuse(),
+		topLevelIndex:       i.topLevelIndex.ResetForReuse(),
 	}
 	twoLevelIterPool.Put(i)
 	return err
@@ -1046,13 +1016,6 @@ func (i *twoLevelCompactionIterator) NextPrefix(succKey []byte) *base.InternalKV
 
 func (i *twoLevelCompactionIterator) Prev() *base.InternalKV {
 	panic("pebble: Prev unimplemented")
-}
-
-func (i *twoLevelCompactionIterator) String() string {
-	if i.vState != nil {
-		return i.vState.fileNum.String()
-	}
-	return i.reader.fileNum.String()
 }
 
 func (i *twoLevelCompactionIterator) skipForward(kv *base.InternalKV) *base.InternalKV {

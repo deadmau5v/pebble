@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/dsl"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // This file contains testing facilities for Spans and FragmentIterators. It's
@@ -364,17 +365,24 @@ func (p *probeIterator) Prev() (*Span, error) {
 	return p.handleOp(op)
 }
 
-func (p *probeIterator) Close() error {
+func (p *probeIterator) Close() {
 	op := op{Kind: OpClose}
 	if p.iter != nil {
-		op.Err = p.iter.Close()
+		p.iter.Close()
 	}
-	_, err := p.handleOp(op)
-	return err
+	_, _ = p.handleOp(op)
 }
 
 func (p *probeIterator) WrapChildren(wrap WrapFn) {
 	p.iter = wrap(p.iter)
+}
+
+// DebugTree is part of the FragmentIterator interface.
+func (p *probeIterator) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", p, p)
+	if p.iter != nil {
+		p.iter.DebugTree(n)
+	}
 }
 
 // RunIterCmd evaluates a datadriven command controlling an internal
@@ -503,10 +511,10 @@ type invalidatingIter struct {
 var _ FragmentIterator = (*invalidatingIter)(nil)
 
 func (i *invalidatingIter) invalidate(s *Span, err error) (*Span, error) {
-	// Zero the entirety of the byte bufs and the keys slice.
+	// Mangle the entirety of the byte bufs and the keys slice.
 	for j := range i.bufs {
 		for k := range i.bufs[j] {
-			i.bufs[j][k] = 0x00
+			i.bufs[j][k] = 0xff
 		}
 		i.bufs[j] = nil
 	}
@@ -522,8 +530,9 @@ func (i *invalidatingIter) invalidate(s *Span, err error) (*Span, error) {
 	i.bufs = i.bufs[:0]
 	i.keys = i.keys[:0]
 	i.span = Span{
-		Start: i.saveBytes(s.Start),
-		End:   i.saveBytes(s.End),
+		Start:     i.saveBytes(s.Start),
+		End:       i.saveBytes(s.End),
+		KeysOrder: s.KeysOrder,
 	}
 	for j := range s.Keys {
 		i.keys = append(i.keys, Key{
@@ -551,7 +560,20 @@ func (i *invalidatingIter) First() (*Span, error)            { return i.invalida
 func (i *invalidatingIter) Last() (*Span, error)             { return i.invalidate(i.iter.Last()) }
 func (i *invalidatingIter) Next() (*Span, error)             { return i.invalidate(i.iter.Next()) }
 func (i *invalidatingIter) Prev() (*Span, error)             { return i.invalidate(i.iter.Prev()) }
-func (i *invalidatingIter) Close() error                     { return i.iter.Close() }
+
+func (i *invalidatingIter) Close() {
+	_, _ = i.invalidate(nil, nil)
+	i.iter.Close()
+}
+
 func (i *invalidatingIter) WrapChildren(wrap WrapFn) {
 	i.iter = wrap(i.iter)
+}
+
+// DebugTree is part of the FragmentIterator interface.
+func (i *invalidatingIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", i, i)
+	if i.iter != nil {
+		i.iter.DebugTree(n)
+	}
 }

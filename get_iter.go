@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // getIter is an internal iterator used to perform gets. It iterates through
@@ -20,7 +21,7 @@ import (
 type getIter struct {
 	comparer *Comparer
 	newIters tableNewIters
-	snapshot uint64
+	snapshot base.SeqNum
 	iterOpts IterOptions
 	key      []byte
 	prefix   []byte
@@ -36,7 +37,7 @@ type getIter struct {
 	// deletion encounterd transitions tombstoned to true. The tombstonedSeqNum
 	// field is updated to hold the sequence number of the tombstone.
 	tombstoned       bool
-	tombstonedSeqNum uint64
+	tombstonedSeqNum base.SeqNum
 	err              error
 }
 
@@ -110,7 +111,7 @@ func (g *getIter) Next() *base.InternalKV {
 					// If the KV pair is not visible at the get's snapshot,
 					// Next. The level may still contain older keys with the
 					// same user key that are visible.
-					if !g.iterKV.Visible(g.snapshot, base.InternalKeySeqNumMax) {
+					if !g.iterKV.Visible(g.snapshot, base.SeqNumMax) {
 						g.iterKV = g.iter.Next()
 						continue
 					}
@@ -161,6 +162,14 @@ func (g *getIter) SetBounds(lower, upper []byte) {
 
 func (g *getIter) SetContext(_ context.Context) {}
 
+// DebugTree is part of the InternalIterator interface.
+func (g *getIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", g, g)
+	if g.iter != nil {
+		g.iter.DebugTree(n)
+	}
+}
+
 func (g *getIter) initializeNextIterator() (ok bool) {
 	// A batch's keys shadow all other keys, so we visit the batch first.
 	if g.batch != nil {
@@ -173,7 +182,7 @@ func (g *getIter) initializeNextIterator() (ok bool) {
 		if !g.maybeSetTombstone(g.batch.newRangeDelIter(nil,
 			// Get always reads the entirety of the batch's history, so no
 			// batch keys should be filtered.
-			base.InternalKeySeqNumMax,
+			base.SeqNumMax,
 		)) {
 			return false
 		}
@@ -288,8 +297,6 @@ func (g *getIter) maybeSetTombstone(rangeDelIter keyspan.FragmentIterator) (ok b
 	// care about the most recent range deletion that's visible because it's the
 	// "most powerful."
 	g.tombstonedSeqNum, g.tombstoned = t.LargestVisibleSeqNum(g.snapshot)
-	if g.err = firstError(g.err, rangeDelIter.Close()); g.err != nil {
-		return false
-	}
+	rangeDelIter.Close()
 	return true
 }

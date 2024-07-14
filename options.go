@@ -15,11 +15,13 @@ import (
 	"unicode"
 
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/fifo"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
@@ -202,7 +204,7 @@ type IterOptions struct {
 	// snapshotForHideObsoletePoints is specified for/by levelIter when opening
 	// files and is used to decide whether to hide obsolete points. A value of 0
 	// implies obsolete points should not be hidden.
-	snapshotForHideObsoletePoints uint64
+	snapshotForHideObsoletePoints base.SeqNum
 
 	// NB: If adding new Options, you must account for them in iterator
 	// construction and Iterator.SetOptions.
@@ -262,7 +264,7 @@ type scanInternalOptions struct {
 	IterOptions
 
 	visitPointKey     func(key *InternalKey, value LazyValue, iterInfo IteratorLevel) error
-	visitRangeDel     func(start, end []byte, seqNum uint64) error
+	visitRangeDel     func(start, end []byte, seqNum SeqNum) error
 	visitRangeKey     func(start, end []byte, keys []rangekey.Key) error
 	visitSharedFile   func(sst *SharedSSTMeta) error
 	visitExternalFile func(sst *ExternalFile) error
@@ -483,10 +485,24 @@ type Options struct {
 	// The default cache size is 8 MB.
 	Cache *cache.Cache
 
+	// LoadBlockSema, if set, is used to limit the number of blocks that can be
+	// loaded (i.e. read from the filesystem) in parallel. Each load acquires one
+	// unit from the semaphore for the duration of the read.
+	LoadBlockSema *fifo.Semaphore
+
 	// Cleaner cleans obsolete files.
 	//
 	// The default cleaner uses the DeleteCleaner.
 	Cleaner Cleaner
+
+	// Local contains option that pertain to files stored on the local filesystem.
+	Local struct {
+		// ReadaheadConfig is used to retrieve the current readahead mode; it is
+		// consulted whenever a read handle is initialized.
+		ReadaheadConfig *ReadaheadConfig
+
+		// TODO(radu): move BytesPerSync, LoadBlockSema, Cleaner here.
+	}
 
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
@@ -1110,6 +1126,9 @@ type WALFailoverOptions struct {
 	// reasonable defaults will be used.
 	wal.FailoverOptions
 }
+
+// ReadaheadConfig controls the use of read-ahead.
+type ReadaheadConfig = objstorageprovider.ReadaheadConfig
 
 // DebugCheckLevels calls CheckLevels on the provided database.
 // It may be set in the DebugCheck field of Options to check
@@ -1933,13 +1952,10 @@ func (o *Options) Validate() error {
 func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 	var readerOpts sstable.ReaderOptions
 	if o != nil {
-		readerOpts.Cache = o.Cache
+		readerOpts.LoadBlockSema = o.LoadBlockSema
 		readerOpts.Comparer = o.Comparer
+		readerOpts.Merger = o.Merger
 		readerOpts.Filters = o.Filters
-		if o.Merger != nil {
-			readerOpts.Merge = o.Merger.Merge
-			readerOpts.MergerName = o.Merger.Name
-		}
 		readerOpts.LoggerAndTracer = o.LoggerAndTracer
 	}
 	return readerOpts
@@ -1951,7 +1967,6 @@ func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstab
 	var writerOpts sstable.WriterOptions
 	writerOpts.TableFormat = format
 	if o != nil {
-		writerOpts.Cache = o.Cache
 		writerOpts.Comparer = o.Comparer
 		if o.Merger != nil {
 			writerOpts.MergerName = o.Merger.Name

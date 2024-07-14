@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // A SpanMask may be used to configure an interleaving iterator to skip point
@@ -979,7 +980,7 @@ func (i *InterleavingIter) yieldPointKey() *base.InternalKV {
 
 func (i *InterleavingIter) yieldSyntheticSpanStartMarker(lowerBound []byte) *base.InternalKV {
 	i.spanMarker.K.UserKey = i.startKey()
-	i.spanMarker.K.Trailer = base.MakeTrailer(base.InternalKeySeqNumMax, i.span.Keys[0].Kind())
+	i.spanMarker.K.Trailer = base.MakeTrailer(base.SeqNumMax, i.span.Keys[0].Kind())
 
 	// Truncate the key we return to our lower bound if we have one. Note that
 	// we use the lowerBound function parameter, not i.lower. The lowerBound
@@ -1016,7 +1017,7 @@ func (i *InterleavingIter) yieldSyntheticSpanStartMarker(lowerBound []byte) *bas
 
 func (i *InterleavingIter) yieldSyntheticSpanEndMarker() *base.InternalKV {
 	i.spanMarker.K.UserKey = i.endKey()
-	i.spanMarker.K.Trailer = base.MakeTrailer(base.InternalKeySeqNumMax, i.span.Keys[0].Kind())
+	i.spanMarker.K.Trailer = base.MakeTrailer(base.SeqNumMax, i.span.Keys[0].Kind())
 	return i.verify(&i.spanMarker)
 }
 
@@ -1117,9 +1118,13 @@ func (i *InterleavingIter) savePoint(kv *base.InternalKV) {
 //
 // Span will never return an invalid or empty span.
 func (i *InterleavingIter) Span() *Span {
+	if invariants.Enabled && i.pointIter == nil {
+		panic("Span() called after close")
+	}
 	if !i.withinSpan || len(i.span.Keys) == 0 {
 		return nil
-	} else if i.truncated {
+	}
+	if i.truncated {
 		return &i.truncatedSpan
 	}
 	return i.span
@@ -1137,6 +1142,17 @@ func (i *InterleavingIter) SetContext(ctx context.Context) {
 	i.pointIter.SetContext(ctx)
 }
 
+// DebugTree is part of the InternalIterator interface.
+func (i *InterleavingIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", i, i)
+	if i.pointIter != nil {
+		i.pointIter.DebugTree(n)
+	}
+	if i.keyspanIter != nil {
+		i.keyspanIter.DebugTree(n)
+	}
+}
+
 // Invalidate invalidates the interleaving iterator's current position, clearing
 // its state. This prevents optimizations such as reusing the current span on
 // seek.
@@ -1152,9 +1168,11 @@ func (i *InterleavingIter) Error() error {
 
 // Close implements (base.InternalIterator).Close.
 func (i *InterleavingIter) Close() error {
-	perr := i.pointIter.Close()
-	rerr := i.keyspanIter.Close()
-	return firstError(perr, rerr)
+	err := i.pointIter.Close()
+	i.pointIter = nil
+	i.keyspanIter.Close()
+	i.keyspanIter = nil
+	return err
 }
 
 // String implements (base.InternalIterator).String.

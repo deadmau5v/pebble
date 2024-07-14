@@ -33,7 +33,7 @@ var NoopTransform Transformer = TransformerFunc(func(_ base.Compare, s Span, dst
 
 // VisibleTransform filters keys that are invisible at the provided snapshot
 // sequence number.
-func VisibleTransform(snapshot uint64) Transformer {
+func VisibleTransform(snapshot base.SeqNum) Transformer {
 	return TransformerFunc(func(_ base.Compare, s Span, dst *Span) error {
 		dst.Start, dst.End = s.Start, s.End
 		dst.Keys = dst.Keys[:0]
@@ -42,7 +42,7 @@ func VisibleTransform(snapshot uint64) Transformer {
 			// because a batch's visible span keys are filtered when they're
 			// fragmented. There's no requirement to enforce visibility at
 			// iteration time.
-			if base.Visible(k.SeqNum(), snapshot, base.InternalKeySeqNumMax) {
+			if base.Visible(k.SeqNum(), snapshot, base.SeqNumMax) {
 				dst.Keys = append(dst.Keys, k)
 			}
 		}
@@ -134,6 +134,6 @@ func (t *TransformerIter) Prev() (*Span, error) {
 }
 
 // Close implements the FragmentIterator interface.
-func (t *TransformerIter) Close() error {
-	return t.FragmentIterator.Close()
+func (t *TransformerIter) Close() {
+	t.FragmentIterator.Close()
 }

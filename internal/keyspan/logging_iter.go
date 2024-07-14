@@ -133,18 +133,21 @@ func (i *loggingIter) Prev() (*Span, error) {
 }
 
 // Close implements FragmentIterator.
-func (i *loggingIter) Close() error {
+func (i *loggingIter) Close() {
 	opEnd := i.opStartf("Close()")
-	err := i.iter.Close()
-	if err != nil {
-		opEnd(err)
-	} else {
-		opEnd()
-	}
-	return err
+	i.iter.Close()
+	opEnd()
 }
 
 // WrapChildren implements FragmentIterator.
 func (i *loggingIter) WrapChildren(wrap WrapFn) {
 	i.iter = wrap(i.iter)
+}
+
+// DebugTree is part of the FragmentIterator interface.
+func (i *loggingIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", i, i)
+	if i.iter != nil {
+		i.iter.DebugTree(n)
+	}
 }

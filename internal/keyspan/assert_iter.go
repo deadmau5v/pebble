@@ -10,9 +10,10 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
-// Assert wraps an iterator and asserts that operations return sane results.
+// Assert wraps an iterator which asserts that operations return sane results.
 func Assert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
 	return &assertIter{
 		iter: iter,
@@ -20,13 +21,15 @@ func Assert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
 	}
 }
 
-// MaybeAssert wraps an iterator and asserts that operations return sane
-// results if we are in testing mode.
+// MaybeAssert potentially wraps an iterator with Assert and/or
+// NewInvalidatingIter if we are in testing mode.
 func MaybeAssert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
-	if invariants.Enabled && iter != nil {
-		// Don't wrap an assertIter.
-		if _, ok := iter.(*assertIter); !ok {
-			return Assert(iter, cmp)
+	if invariants.Enabled {
+		if invariants.Sometimes(60 /* percent */) {
+			iter = NewInvalidatingIter(iter)
+		}
+		if invariants.Sometimes(60 /* percent */) {
+			iter = Assert(iter, cmp)
 		}
 	}
 	return iter
@@ -163,11 +166,19 @@ func (i *assertIter) Prev() (*Span, error) {
 }
 
 // Close implements FragmentIterator.
-func (i *assertIter) Close() error {
-	return i.iter.Close()
+func (i *assertIter) Close() {
+	i.iter.Close()
 }
 
 // WrapChildren implements FragmentIterator.
 func (i *assertIter) WrapChildren(wrap WrapFn) {
 	i.iter = wrap(i.iter)
+}
+
+// DebugTree is part of the FragmentIterator interface.
+func (i *assertIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", i, i)
+	if i.iter != nil {
+		i.iter.DebugTree(n)
+	}
 }

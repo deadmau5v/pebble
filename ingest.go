@@ -15,7 +15,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/private"
+	"github.com/cockroachdb/pebble/internal/overlap"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
@@ -252,8 +253,13 @@ func ingestLoad1(
 	cacheID uint64,
 	fileNum base.FileNum,
 ) (*fileMetadata, error) {
-	cacheOpts := private.SSTableCacheOpts(cacheID, base.PhysicalTableDiskFileNum(fileNum)).(sstable.ReaderOption)
-	r, err := sstable.NewReader(readable, opts.MakeReaderOptions(), cacheOpts)
+	o := opts.MakeReaderOptions()
+	o.SetInternalCacheOpts(sstableinternal.CacheOptions{
+		Cache:   opts.Cache,
+		CacheID: cacheID,
+		FileNum: base.PhysicalTableDiskFileNum(fileNum),
+	})
+	r, err := sstable.NewReader(readable, o)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +321,7 @@ func ingestLoad1(
 		}
 	}
 
-	iter, err := r.NewRawRangeDelIter(sstable.NoTransforms)
+	iter, err := r.NewRawRangeDelIter(sstable.NoFragmentTransforms)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +351,7 @@ func ingestLoad1(
 
 	// Update the range-key bounds for the table.
 	{
-		iter, err := r.NewRawRangeKeyIter(sstable.NoTransforms)
+		iter, err := r.NewRawRangeKeyIter(sstable.NoFragmentTransforms)
 		if err != nil {
 			return nil, err
 		}
@@ -755,7 +761,9 @@ func (d *DB) ingestUnprotectExternalBackings(lr ingestLoadResult) {
 	}
 }
 
-func setSeqNumInMetadata(m *fileMetadata, seqNum uint64, cmp Compare, format base.FormatKey) error {
+func setSeqNumInMetadata(
+	m *fileMetadata, seqNum base.SeqNum, cmp Compare, format base.FormatKey,
+) error {
 	setSeqFn := func(k base.InternalKey) base.InternalKey {
 		return base.MakeInternalKey(k.UserKey, seqNum, k.Kind())
 	}
@@ -794,7 +802,7 @@ func setSeqNumInMetadata(m *fileMetadata, seqNum uint64, cmp Compare, format bas
 }
 
 func ingestUpdateSeqNum(
-	cmp Compare, format base.FormatKey, seqNum uint64, loadResult ingestLoadResult,
+	cmp Compare, format base.FormatKey, seqNum base.SeqNum, loadResult ingestLoadResult,
 ) error {
 	// Shared sstables are required to be sorted by level ascending. We then
 	// iterate the shared sstables in reverse, assigning the lower sequence
@@ -831,7 +839,8 @@ func ingestUpdateSeqNum(
 // is returned as the splitFile.
 func ingestTargetLevel(
 	ctx context.Context,
-	overlapChecker *overlapChecker,
+	cmp base.Compare,
+	lsmOverlap overlap.WithLSM,
 	baseLevel int,
 	compactions map[*compaction]struct{},
 	meta *fileMetadata,
@@ -903,46 +912,32 @@ func ingestTargetLevel(
 	// existing point that falls within the ingested table bounds as being "data
 	// overlap".
 
-	// This assertion implicitly checks that we have the current version of
-	// the metadata.
-	if overlapChecker.v.L0Sublevels == nil {
-		return 0, nil, base.AssertionFailedf("could not read L0 sublevels")
-	}
-	bounds := meta.UserKeyBounds()
-
-	// Check for overlap over the keys of L0.
-	if overlap, err := overlapChecker.DetermineAnyDataOverlapInLevel(ctx, bounds, 0); err != nil {
-		return 0, nil, err
-	} else if overlap {
+	if lsmOverlap[0].Result == overlap.Data {
 		return 0, nil, nil
 	}
-
+	targetLevel = 0
+	splitFile = nil
 	for level := baseLevel; level < numLevels; level++ {
-		dataOverlap, err := overlapChecker.DetermineAnyDataOverlapInLevel(ctx, bounds, level)
-		if err != nil {
-			return 0, nil, err
-		} else if dataOverlap {
-			return targetLevel, splitFile, nil
-		}
-
-		// Check boundary overlap.
 		var candidateSplitFile *fileMetadata
-		boundaryOverlaps := overlapChecker.v.Overlaps(level, bounds)
-		if !boundaryOverlaps.Empty() {
-			// We are already guaranteed to not have any data overlaps with files
-			// in boundaryOverlaps, otherwise we'd have returned in the above if
-			// statements. Use this, plus boundaryOverlaps.Len() == 1 to detect for
-			// the case where we can slot this file into the current level despite
-			// a boundary overlap, by splitting one existing file into two virtual
-			// sstables.
-			if suggestSplit && boundaryOverlaps.Len() == 1 {
-				iter := boundaryOverlaps.Iter()
-				candidateSplitFile = iter.First()
-			} else {
-				// We either don't want to suggest ingest-time splits (i.e.
-				// !suggestSplit), or we boundary-overlapped with more than one file.
+		switch lsmOverlap[level].Result {
+		case overlap.Data:
+			// We cannot ingest into or under this level; return the best target level
+			// so far.
+			return targetLevel, splitFile, nil
+
+		case overlap.OnlyBoundary:
+			if !suggestSplit || lsmOverlap[level].SplitFile == nil {
+				// We can ingest under this level, but not into this level.
 				continue
 			}
+			// We can ingest into this level if we split this file.
+			candidateSplitFile = lsmOverlap[level].SplitFile
+
+		case overlap.None:
+		// We can ingest into this level.
+
+		default:
+			return 0, nil, base.AssertionFailedf("unexpected WithLevel.Result: %v", lsmOverlap[level].Result)
 		}
 
 		// Check boundary overlap with any ongoing compactions. We consider an
@@ -964,8 +959,8 @@ func ingestTargetLevel(
 			if c.outputLevel == nil || level != c.outputLevel.level {
 				continue
 			}
-			if overlapChecker.comparer.Compare(meta.Smallest.UserKey, c.largest.UserKey) <= 0 &&
-				overlapChecker.comparer.Compare(meta.Largest.UserKey, c.smallest.UserKey) >= 0 {
+			if cmp(meta.Smallest.UserKey, c.largest.UserKey) <= 0 &&
+				cmp(meta.Largest.UserKey, c.smallest.UserKey) >= 0 {
 				overlaps = true
 				break
 			}
@@ -1193,7 +1188,7 @@ func (d *DB) IngestAndExcise(
 
 // Both DB.mu and commitPipeline.mu must be held while this is called.
 func (d *DB) newIngestedFlushableEntry(
-	meta []*fileMetadata, seqNum uint64, logNum base.DiskFileNum, exciseSpan KeyRange,
+	meta []*fileMetadata, seqNum base.SeqNum, logNum base.DiskFileNum, exciseSpan KeyRange,
 ) (*flushableEntry, error) {
 	// Update the sequence number for all of the sstables in the
 	// metadata. Writing the metadata to the manifest when the
@@ -1204,7 +1199,7 @@ func (d *DB) newIngestedFlushableEntry(
 	// time, then we'll lose the ingest sequence number information. But this
 	// information will also be reconstructed on node restart.
 	for i, m := range meta {
-		if err := setSeqNumInMetadata(m, seqNum+uint64(i), d.cmp, d.opts.Comparer.FormatKey); err != nil {
+		if err := setSeqNumInMetadata(m, seqNum+base.SeqNum(i), d.cmp, d.opts.Comparer.FormatKey); err != nil {
 			return nil, err
 		}
 	}
@@ -1240,7 +1235,7 @@ func (d *DB) newIngestedFlushableEntry(
 // recycle the WAL in this function is irrelevant as long as the correct log
 // numbers are assigned to the appropriate flushable.
 func (d *DB) handleIngestAsFlushable(
-	meta []*fileMetadata, seqNum uint64, exciseSpan KeyRange,
+	meta []*fileMetadata, seqNum base.SeqNum, exciseSpan KeyRange,
 ) error {
 	b := d.NewBatch()
 	for _, m := range meta {
@@ -1276,7 +1271,7 @@ func (d *DB) handleIngestAsFlushable(
 	if err != nil {
 		return err
 	}
-	nextSeqNum := seqNum + uint64(b.Count())
+	nextSeqNum := seqNum + base.SeqNum(b.Count())
 
 	// Set newLogNum to the logNum of the previous flushable. This value is
 	// irrelevant if the WAL is disabled. If the WAL is enabled, then we set
@@ -1394,7 +1389,7 @@ func (d *DB) ingest(
 	var mut *memTable
 	// asFlushable indicates whether the sstable was ingested as a flushable.
 	var asFlushable bool
-	prepare := func(seqNum uint64) {
+	prepare := func(seqNum base.SeqNum) {
 		// Note that d.commit.mu is held by commitPipeline when calling prepare.
 
 		// Determine the set of bounds we care about for the purpose of checking
@@ -1427,7 +1422,7 @@ func (d *DB) ingest(
 				if s.efos == nil {
 					continue
 				}
-				if base.Visible(seqNum, s.efos.seqNum, base.InternalKeySeqNumMax) {
+				if base.Visible(seqNum, s.efos.seqNum, base.SeqNumMax) {
 					// We only worry about snapshots older than the excise. Any snapshots
 					// created after the excise should see the excised view of the LSM
 					// anyway.
@@ -1562,7 +1557,7 @@ func (d *DB) ingest(
 	}
 
 	var ve *versionEdit
-	apply := func(seqNum uint64) {
+	apply := func(seqNum base.SeqNum) {
 		if err != nil || asFlushable {
 			// An error occurred during prepare.
 			if mut != nil {
@@ -2095,7 +2090,7 @@ func (d *DB) ingestApply(
 	lr ingestLoadResult,
 	mut *memTable,
 	exciseSpan KeyRange,
-	exciseSeqNum uint64,
+	exciseSeqNum base.SeqNum,
 ) (*versionEdit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -2202,14 +2197,20 @@ func (d *DB) ingestApply(
 					f.Level = 6
 				}
 			} else {
-				// TODO(bilal): ingestTargetLevel does disk IO (reading files for data
-				// overlap) even though we're holding onto d.mu. Consider unlocking
-				// d.mu while we do this. We already hold versions.logLock so we should
-				// not see any version applications while we're at this. The one
-				// complication here would be pulling out the mu.compact.inProgress
-				// check from ingestTargetLevel, as that requires d.mu to be held.
-				f.Level, splitFile, err = ingestTargetLevel(ctx, overlapChecker,
-					baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit)
+				// We check overlap against the LSM without holding DB.mu. Note that we
+				// are still holding the log lock, so the version cannot change.
+				// TODO(radu): perform this check optimistically outside of the log lock.
+				var lsmOverlap overlap.WithLSM
+				lsmOverlap, err = func() (overlap.WithLSM, error) {
+					d.mu.Unlock()
+					defer d.mu.Lock()
+					return overlapChecker.DetermineLSMOverlap(ctx, m.UserKeyBounds())
+				}()
+				if err == nil {
+					f.Level, splitFile, err = ingestTargetLevel(
+						ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit,
+					)
+				}
 			}
 
 			if splitFile != nil {
@@ -2364,7 +2365,7 @@ func (d *DB) ingestApply(
 		for s := d.mu.snapshots.root.next; s != &d.mu.snapshots.root; s = s.next {
 			// Skip non-EFOS snapshots, and also skip any EFOS that were created
 			// *after* the excise.
-			if s.efos == nil || base.Visible(exciseSeqNum, s.efos.seqNum, base.InternalKeySeqNumMax) {
+			if s.efos == nil || base.Visible(exciseSeqNum, s.efos.seqNum, base.SeqNumMax) {
 				continue
 			}
 			efos := s.efos

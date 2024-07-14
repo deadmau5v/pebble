@@ -4,7 +4,10 @@
 
 package keyspan
 
-import "github.com/cockroachdb/pebble/internal/base"
+import (
+	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
+)
 
 // FragmentIterator defines an iterator interface over spans. The spans
 // surfaced by a FragmentIterator must be non-overlapping. This is achieved by
@@ -55,16 +58,18 @@ type FragmentIterator interface {
 	// previous call to SeekLT or Prev returned an invalid span.
 	Prev() (*Span, error)
 
-	// Close closes the iterator and returns any accumulated error. Exhausting
-	// the iterator is not considered to be an error. It is valid to call Close
+	// Close closes the iterator. It is not in general valid to call Close
 	// multiple times. Other methods should not be called after the iterator has
-	// been closed.
-	Close() error
+	// been closed. Spans returned by a previous method should also not be used
+	// after the iterator has been closed.
+	Close()
 
 	// WrapChildren wraps any child iterators using the given function. The
 	// function can call WrapChildren to recursively wrap an entire iterator
 	// stack. Used only for debug logging.
 	WrapChildren(wrap WrapFn)
+
+	base.IteratorDebug
 }
 
 // SpanIterOptions is a subset of IterOptions that are necessary to instantiate
@@ -207,13 +212,16 @@ func (i *Iter) Prev() (*Span, error) {
 }
 
 // Close implements FragmentIterator.Close.
-func (i *Iter) Close() error {
-	return nil
-}
+func (i *Iter) Close() {}
 
 func (i *Iter) String() string {
-	return "fragmented-spans"
+	return "keyspan.Iter"
 }
 
 // WrapChildren implements FragmentIterator.
 func (i *Iter) WrapChildren(wrap WrapFn) {}
+
+// DebugTree is part of the FragmentIterator interface.
+func (i *Iter) DebugTree(tp treeprinter.Node) {
+	tp.Childf("%T(%p)", i, i)
+}

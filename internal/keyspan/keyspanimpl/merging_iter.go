@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // TODO(jackson): Consider implementing an optimization to seek lower levels
@@ -200,7 +201,7 @@ type MergingIter struct {
 // MergingBuffers holds buffers used while merging keyspans.
 type MergingBuffers struct {
 	// keys holds all of the keys across all levels that overlap the key span
-	// [start, end), sorted by Trailer descending. This slice is reconstituted
+	// [start, end), sorted by InternalKeyTrailer descending. This slice is reconstituted
 	// in synthesizeKeys from each mergingIterLevel's keys every time the
 	// [start, end) bounds change.
 	//
@@ -676,14 +677,12 @@ func (m *MergingIter) Prev() (*keyspan.Span, error) {
 }
 
 // Close closes the iterator, releasing all acquired resources.
-func (m *MergingIter) Close() error {
-	var err error
+func (m *MergingIter) Close() {
 	for i := range m.levels {
-		err = firstError(err, m.levels[i].iter.Close())
+		m.levels[i].iter.Close()
 	}
 	m.levels = nil
 	m.heap.items = m.heap.items[:0]
-	return err
 }
 
 // String implements fmt.Stringer.
@@ -1108,6 +1107,16 @@ func (m *MergingIter) WrapChildren(wrap keyspan.WrapFn) {
 	m.wrapFn = wrap
 }
 
+// DebugTree is part of the FragmentIterator interface.
+func (m *MergingIter) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", m, m)
+	for i := range m.levels {
+		if iter := m.levels[i].iter; iter != nil {
+			m.levels[i].iter.DebugTree(n)
+		}
+	}
+}
+
 type mergingIterItem struct {
 	// boundKey points to the corresponding mergingIterLevel's `iterKey`.
 	*boundKey
@@ -1239,11 +1248,4 @@ func (k boundKey) String() string {
 	fmt.Fprintf(&buf, "%s", k.span)
 	fmt.Fprint(&buf, "]")
 	return buf.String()
-}
-
-func firstError(e1, e2 error) error {
-	if e1 == nil {
-		return e2
-	}
-	return e1
 }

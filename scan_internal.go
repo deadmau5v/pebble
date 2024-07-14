@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
@@ -126,7 +127,7 @@ type pointCollapsingIterator struct {
 	comparer *base.Comparer
 	merge    base.Merge
 	err      error
-	seqNum   uint64
+	seqNum   base.SeqNum
 	// The current position of `iter`. Always owned by the underlying iter.
 	iterKV *base.InternalKV
 	// The last saved key. findNextEntry and similar methods are expected to save
@@ -144,7 +145,7 @@ type pointCollapsingIterator struct {
 	savedKeyBuf []byte
 	// If fixedSeqNum is non-zero, all emitted points are verified to have this
 	// fixed sequence number.
-	fixedSeqNum uint64
+	fixedSeqNum base.SeqNum
 }
 
 func (p *pointCollapsingIterator) Span() *keyspan.Span {
@@ -363,6 +364,12 @@ func (p *pointCollapsingIterator) SetContext(ctx context.Context) {
 	p.iter.SetContext(ctx)
 }
 
+// DebugTree is part of the InternalIterator interface.
+func (p *pointCollapsingIterator) DebugTree(tp treeprinter.Node) {
+	n := tp.Childf("%T(%p)", p, p)
+	p.iter.DebugTree(n)
+}
+
 // String implements the InternalIterator interface.
 func (p *pointCollapsingIterator) String() string {
 	return p.iter.String()
@@ -423,7 +430,7 @@ type scanInternalIterator struct {
 	alloc           *iterAlloc
 	newIters        tableNewIters
 	newIterRangeKey keyspanimpl.TableNewSpanIter
-	seqNum          uint64
+	seqNum          base.SeqNum
 	iterLevels      []IteratorLevel
 	mergingIter     *mergingIter
 
@@ -724,7 +731,7 @@ func scanInternalImpl(
 					return errors.Wrapf(ErrInvalidSkipSharedIteration, "external file is present but no external file visitor is defined")
 				}
 
-				if !base.Visible(f.LargestSeqNum, seqNum, base.InternalKeySeqNumMax) {
+				if !base.Visible(f.LargestSeqNum, seqNum, base.SeqNumMax) {
 					return errors.Wrapf(ErrInvalidSkipSharedIteration, "file %s contains keys newer than snapshot", objMeta.DiskFileNum)
 				}
 
@@ -778,7 +785,7 @@ func scanInternalImpl(
 				// call visitRangeKey.
 				keysCopy := make([]keyspan.Key, len(span.Keys))
 				for i := range span.Keys {
-					keysCopy[i] = span.Keys[i]
+					keysCopy[i].CopyFrom(span.Keys[i])
 					keysCopy[i].Trailer = base.MakeTrailer(0, span.Keys[i].Kind())
 				}
 				keyspan.SortKeysByTrailer(&keysCopy)
@@ -1020,7 +1027,7 @@ func (i *scanInternalIterator) constructRangeKeyIter() error {
 	// NB: We iterate L0's files in reverse order. They're sorted by
 	// LargestSeqNum ascending, and we need to add them to the merging iterator
 	// in LargestSeqNum descending to preserve the merging iterator's invariants
-	// around Key Trailer order.
+	// around Key InternalKeyTrailer order.
 	iter := current.RangeKeyLevels[0].Iter()
 	for f := iter.Last(); f != nil; f = iter.Prev() {
 		spanIter, err := i.newIterRangeKey(f, i.opts.SpanIterOptions())

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
@@ -168,7 +169,7 @@ func TestMergingIterCornerCases(t *testing.T) {
 			var err error
 			r := readers[file.FileNum]
 			if kinds.RangeDeletion() {
-				set.rangeDeletion, err = r.NewRawRangeDelIter(sstable.NoTransforms)
+				set.rangeDeletion, err = r.NewRawRangeDelIter(sstable.NoFragmentTransforms)
 				if err != nil {
 					return iterSet{}, errors.CombineErrors(err, set.CloseAll())
 				}
@@ -306,7 +307,7 @@ func TestMergingIterCornerCases(t *testing.T) {
 
 				i := len(levelIters)
 				levelIters = append(levelIters, mergingIterLevel{iter: li})
-				li.initRangeDel(&levelIters[i].rangeDelIter)
+				li.initRangeDel(levelIters[i].setRangeDelIter)
 			}
 			miter := &mergingIter{}
 			miter.init(nil /* opts */, &stats, cmp, func(a []byte) int { return len(a) }, levelIters...)
@@ -372,9 +373,13 @@ func buildMergingIterTables(
 			b.Fatal(err)
 		}
 	}
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
 
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20)}
-	defer opts.Cache.Unref()
+	var opts sstable.ReaderOptions
+	opts.SetInternalCacheOpts(sstableinternal.CacheOptions{
+		Cache: c,
+	})
 
 	readers := make([]*sstable.Reader, len(files))
 	for i := range files {
@@ -585,14 +590,14 @@ func buildLevelsForMergingIterSeqSeek(
 	}
 	for j := 1; j < len(files); j++ {
 		for _, k := range []int{0, len(keys) - 1} {
-			ikey := base.MakeInternalKey(keys[k], uint64(j), InternalKeyKindSet)
+			ikey := base.MakeInternalKey(keys[k], base.SeqNum(j), InternalKeyKindSet)
 			writers[j][0].Add(ikey, nil)
 		}
 	}
 	lastKey := []byte(fmt.Sprintf("%08d", i))
 	keys = append(keys, lastKey)
 	for j := 0; j < len(files); j++ {
-		lastIKey := base.MakeInternalKey(lastKey, uint64(j), InternalKeyKindSet)
+		lastIKey := base.MakeInternalKey(lastKey, base.SeqNum(j), InternalKeyKindSet)
 		writers[j][1].Add(lastIKey, nil)
 	}
 	for _, levelWriters := range writers {
@@ -608,12 +613,18 @@ func buildLevelsForMergingIterSeqSeek(
 		}
 	}
 
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20), Comparer: DefaultComparer}
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
+
+	opts := sstable.ReaderOptions{Comparer: DefaultComparer}
+	opts.SetInternalCacheOpts(sstableinternal.CacheOptions{
+		Cache: c,
+	})
+
 	if writeBloomFilters {
 		opts.Filters = make(map[string]FilterPolicy)
 		opts.Filters[filterPolicy.Name()] = filterPolicy
 	}
-	defer opts.Cache.Unref()
 
 	readers = make([][]*sstable.Reader, levelCount)
 	for i := range files {
@@ -667,7 +678,7 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 			if err != nil {
 				return iterSet{}, err
 			}
-			rdIter, err := readers[levelIndex][file.FileNum].NewRawRangeDelIter(sstable.NoTransforms)
+			rdIter, err := readers[levelIndex][file.FileNum].NewRawRangeDelIter(sstable.NoFragmentTransforms)
 			if err != nil {
 				iter.Close()
 				return iterSet{}, err
@@ -677,7 +688,7 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 		l := newLevelIter(
 			context.Background(), IterOptions{}, testkeys.Comparer, newIters, levelSlices[i].Iter(),
 			manifest.Level(level), internalIterOpts{})
-		l.initRangeDel(&mils[level].rangeDelIter)
+		l.initRangeDel(mils[level].setRangeDelIter)
 		mils[level].iter = l
 	}
 	var stats base.InternalIteratorStats

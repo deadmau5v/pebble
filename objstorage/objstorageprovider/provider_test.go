@@ -40,7 +40,9 @@ func TestProvider(t *testing.T) {
 		backings := make(map[string]objstorage.RemoteObjectBacking)
 		backingHandles := make(map[string]objstorage.RemoteObjectBackingHandle)
 		var curProvider objstorage.Provider
+		readaheadConfig := NewReadaheadConfig()
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+			readaheadConfig.Set(defaultReadaheadInformed, defaultReadaheadSpeculative)
 			scanArgs := func(desc string, args ...interface{}) {
 				t.Helper()
 				if len(d.CmdArgs) != len(args) {
@@ -68,6 +70,7 @@ func TestProvider(t *testing.T) {
 					st.Remote.CreateOnShared = remote.CreateOnSharedAll
 					st.Remote.CreateOnSharedLocator = ""
 				}
+				st.Local.ReadaheadConfig = readaheadConfig
 				require.NoError(t, fs.MkdirAll(fsDir, 0755))
 				p, err := Open(st)
 				require.NoError(t, err)
@@ -170,18 +173,41 @@ func TestProvider(t *testing.T) {
 				return log.String()
 
 			case "read":
-				forCompaction := false
-				if len(d.CmdArgs) == 2 && d.CmdArgs[1].Key == "for-compaction" {
-					d.CmdArgs = d.CmdArgs[:1]
-					forCompaction = true
+				forCompaction := d.HasArg("for-compaction")
+				if arg, ok := d.Arg("readahead"); ok {
+					var mode ReadaheadMode
+					switch arg.SingleVal(t) {
+					case "off":
+						mode = NoReadahead
+					case "sys-readahead":
+						mode = SysReadahead
+					case "fadvise-sequential":
+						mode = FadviseSequential
+					default:
+						d.Fatalf(t, "unknown readahead mode %s", arg.SingleVal(t))
+					}
+					if forCompaction {
+						readaheadConfig.Set(mode, defaultReadaheadSpeculative)
+					} else {
+						readaheadConfig.Set(defaultReadaheadInformed, mode)
+					}
 				}
+
+				d.CmdArgs = d.CmdArgs[:1]
 				var fileNum base.DiskFileNum
-				scanArgs("<file-num> [for-compaction]", &fileNum)
+				scanArgs("<file-num> [for-compaction] [readahead|speculative-overhead=off|sys-readahead|fadvise-sequential]", &fileNum)
 				r, err := curProvider.OpenForReading(ctx, base.FileTypeTable, fileNum, objstorage.OpenOptions{})
 				if err != nil {
 					return err.Error()
 				}
-				rh := r.NewReadHandle(ctx, objstorage.NoReadBefore)
+				var rh objstorage.ReadHandle
+				// Test both ways of getting a handle.
+				if rand.Intn(2) == 0 {
+					rh = r.NewReadHandle(ctx, objstorage.NoReadBefore)
+				} else {
+					var prealloc PreallocatedReadHandle
+					rh = UsePreallocatedReadHandle(ctx, r, objstorage.NoReadBefore, &prealloc)
+				}
 				if forCompaction {
 					rh.SetupForCompaction()
 				}

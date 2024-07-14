@@ -167,7 +167,7 @@ type Iter struct {
 	rangeKeyCompactor RangeKeySpanCompactor
 	err               error
 	// `key.UserKey` is set to `keyBuf` caused by saving `i.iterKV.UserKey`
-	// and `key.Trailer` is set to `i.iterKV.Trailer`. This is the
+	// and `key.InternalKeyTrailer` is set to `i.iterKV.InternalKeyTrailer`. This is the
 	// case on return from all public methods -- these methods return `key`.
 	// Additionally, it is the internal state when the code is moving to the
 	// next key so it can determine whether the user key has changed from
@@ -176,7 +176,7 @@ type Iter struct {
 	// keyTrailer is updated when `i.key` is updated and holds the key's
 	// original trailer (eg, before any sequence-number zeroing or changes to
 	// key kind).
-	keyTrailer  uint64
+	keyTrailer  base.InternalKeyTrailer
 	value       []byte
 	valueCloser io.Closer
 	// Temporary buffer used for storing the previous user key in order to
@@ -223,7 +223,7 @@ type Iter struct {
 	forceObsoleteDueToRangeDel bool
 	// The index of the snapshot for the current key within the snapshots slice.
 	curSnapshotIdx    int
-	curSnapshotSeqNum uint64
+	curSnapshotSeqNum base.SeqNum
 	// frontiers holds a heap of user keys that affect compaction behavior when
 	// they're exceeded. Before a new key is returned, the compaction iterator
 	// advances the frontier, notifying any code that subscribed to be notified
@@ -239,6 +239,9 @@ type Iter struct {
 	// lastRangeDelSpan stores the last, not compacted tombstone span. It is used
 	// to elide points or mark them as snapshot-pinned.
 	lastRangeDelSpan keyspan.Span
+	// lastRangeDelSpanFrontier is the frontier used to clear out lastRangeDelSpan
+	// when we move beyond its end key.
+	lastRangeDelSpanFrontier frontier
 
 	// span stores the last, compacted tombstone or range key span. It is provided
 	// to the caller via Span().
@@ -327,6 +330,7 @@ func NewIter(
 	i.delElider.Init(i.cmp, cfg.TombstoneElision)
 	i.rangeDelCompactor = MakeRangeDelSpanCompactor(i.cmp, i.cfg.Comparer.Equal, cfg.Snapshots, cfg.TombstoneElision)
 	i.rangeKeyCompactor = MakeRangeKeySpanCompactor(i.cmp, i.cfg.Comparer.Equal, cfg.Snapshots, cfg.RangeKeyElision)
+	i.lastRangeDelSpanFrontier.Init(&i.frontiers, nil, i.lastRangeDelSpanFrontierReached)
 	return i
 }
 
@@ -408,6 +412,8 @@ func (i *Iter) Next() (*base.InternalKey, []byte) {
 	i.pos = iterPosCurForward
 
 	for i.iterKV != nil {
+		i.frontiers.Advance(i.iterKV.K.UserKey)
+
 		// If we entered a new snapshot stripe with the same key, any key we
 		// return on this iteration is only returned because the open snapshot
 		// prevented it from being elided or merged with the key returned for
@@ -437,7 +443,7 @@ func (i *Iter) Next() (*base.InternalKey, []byte) {
 
 			if i.iterKV.Kind() == base.InternalKeyKindRangeDelete {
 				span := i.rangeDelInterleaving.Span()
-				i.lastRangeDelSpan.CopyFrom(span)
+				i.setLastRangeDelSpan(span)
 				i.rangeDelCompactor.Compact(span, &i.span)
 				if i.span.Empty() {
 					// The range del span was elided entirely; don't return this key to the caller.
@@ -732,7 +738,7 @@ func (i *Iter) nextInStripeHelper() stripeChangeType {
 		// were ingested, but range keys are interleaved into the compaction
 		// iterator's input iterator at the maximal sequence number so their
 		// original sequence number will not be observed here.
-		if prevSeqNum := base.SeqNumFromTrailer(i.keyTrailer); (prevSeqNum == 0 || prevSeqNum <= kv.SeqNum()) &&
+		if prevSeqNum := i.keyTrailer.SeqNum(); (prevSeqNum == 0 || prevSeqNum <= kv.SeqNum()) &&
 			i.key.Kind() != base.InternalKeyKindRangeDelete && kv.Kind() != base.InternalKeyKindRangeDelete {
 			prevKey := i.key
 			prevKey.Trailer = i.keyTrailer
@@ -1254,7 +1260,6 @@ func (i *Iter) saveKey() {
 		Trailer: i.iterKV.K.Trailer,
 	}
 	i.keyTrailer = i.key.Trailer
-	i.frontiers.Advance(i.key.UserKey)
 }
 
 // Error returns any error encountered.
@@ -1307,16 +1312,12 @@ const (
 // The key's UserKey must be greater or equal to the last span Start key passed
 // to AddTombstoneSpan. The keys passed to tombstoneCovers calls must be
 // ordered.
-func (i *Iter) tombstoneCovers(key base.InternalKey, snapshot uint64) cover {
+func (i *Iter) tombstoneCovers(key base.InternalKey, snapshot base.SeqNum) cover {
 	if i.lastRangeDelSpan.Empty() {
 		return noCover
 	}
-	if invariants.Enabled && i.cmp(key.UserKey, i.lastRangeDelSpan.Start) < 0 {
+	if invariants.Enabled && (i.cmp(key.UserKey, i.lastRangeDelSpan.Start) < 0 || i.cmp(key.UserKey, i.lastRangeDelSpan.End) >= 0) {
 		panic(errors.AssertionFailedf("invalid key %q, last span %s", key, i.lastRangeDelSpan))
-	}
-	if i.cmp(key.UserKey, i.lastRangeDelSpan.End) >= 0 {
-		i.lastRangeDelSpan.Reset()
-		return noCover
 	}
 	// The Covers() check is very cheap, so we want to do that first.
 	switch {
@@ -1327,6 +1328,19 @@ func (i *Iter) tombstoneCovers(key base.InternalKey, snapshot uint64) cover {
 	default:
 		return coversInvisibly
 	}
+}
+
+func (i *Iter) setLastRangeDelSpan(span *keyspan.Span) {
+	if invariants.Enabled && !i.lastRangeDelSpan.Empty() {
+		panic("last range del span overwritten")
+	}
+	i.lastRangeDelSpan.CopyFrom(span)
+	i.lastRangeDelSpanFrontier.Update(i.lastRangeDelSpan.End)
+}
+
+func (i *Iter) lastRangeDelSpanFrontierReached(key []byte) []byte {
+	i.lastRangeDelSpan.Reset()
+	return nil
 }
 
 // maybeZeroSeqnum attempts to set the seqnum for the current key to 0. Doing

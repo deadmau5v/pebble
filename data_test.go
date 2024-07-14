@@ -23,9 +23,9 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/rangekey"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
@@ -39,9 +39,13 @@ import (
 func runGetCmd(t testing.TB, td *datadriven.TestData, d *DB) string {
 	snap := Snapshot{
 		db:     d,
-		seqNum: InternalKeySeqNumMax,
+		seqNum: base.SeqNumMax,
 	}
-	td.MaybeScanArgs(t, "seq", &snap.seqNum)
+	if td.HasArg("seq") {
+		var n uint64
+		td.ScanArgs(t, "seq", &n)
+		snap.seqNum = base.SeqNum(n)
+	}
 
 	var buf bytes.Buffer
 	for _, data := range strings.Split(td.Input, "\n") {
@@ -710,7 +714,7 @@ func runCompactCmd(td *datadriven.TestData, d *DB) error {
 	parallelize := td.HasArg("parallel")
 	if len(td.CmdArgs) >= 2 && strings.HasPrefix(td.CmdArgs[1].Key, "L") {
 		levelString := td.CmdArgs[1].String()
-		iStart := base.MakeInternalKey([]byte(parts[0]), InternalKeySeqNumMax, InternalKeyKindMax)
+		iStart := base.MakeInternalKey([]byte(parts[0]), base.SeqNumMax, InternalKeyKindMax)
 		iEnd := base.MakeInternalKey([]byte(parts[1]), 0, 0)
 		if levelString[0] != 'L' {
 			return errors.Errorf("expected L<n>: %s", levelString)
@@ -767,7 +771,7 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) {
 	opts = opts.EnsureDefaults()
 
-	var snapshots []uint64
+	var snapshots []base.SeqNum
 	var levelMaxBytes map[int]int64
 	for _, arg := range td.CmdArgs {
 		switch arg.Key {
@@ -781,13 +785,9 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 				opts.Levels[i].TargetFileSize = size
 			}
 		case "snapshots":
-			snapshots = make([]uint64, len(arg.Vals))
+			snapshots = make([]base.SeqNum, len(arg.Vals))
 			for i := range arg.Vals {
-				seqNum, err := strconv.ParseUint(arg.Vals[i], 10, 64)
-				if err != nil {
-					return nil, err
-				}
-				snapshots[i] = seqNum
+				snapshots[i] = base.ParseSeqNum(arg.Vals[i])
 				if i > 0 && snapshots[i] < snapshots[i-1] {
 					return nil, errors.New("Snapshots must be in ascending order")
 				}
@@ -1223,11 +1223,16 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	if err != nil {
 		return err.Error()
 	}
+	readerOpts := d.opts.MakeReaderOptions()
 	// TODO(bananabrick): cacheOpts is used to set the file number on a Reader,
 	// and virtual sstables expect this file number to be set. Split out the
 	// opts into fileNum opts, and cache opts.
-	cacheOpts := private.SSTableCacheOpts(0, backingFileNum).(sstable.ReaderOption)
-	r, err := sstable.NewReader(readable, d.opts.MakeReaderOptions(), cacheOpts)
+	readerOpts.SetInternalCacheOpts(sstableinternal.CacheOptions{
+		Cache:   d.opts.Cache,
+		CacheID: 0,
+		FileNum: backingFileNum,
+	})
+	r, err := sstable.NewReader(readable, readerOpts)
 	if err != nil {
 		return err.Error()
 	}
@@ -1344,7 +1349,7 @@ func runIngestExternalCmd(
 		usageErr := func(info interface{}) {
 			t.Helper()
 			td.Fatalf(t, "error parsing %q: %v; "+
-				"usage: obj bounds=(smallest,largest) [size=x] [synthetic-prefix=prefix] [synthetic-suffix=suffix]",
+				"usage: obj bounds=(smallest,largest) [size=x] [synthetic-prefix=prefix] [synthetic-suffix=suffix] [no-point-keys] [has-range-keys]",
 				line, info,
 			)
 		}
@@ -1392,6 +1397,12 @@ func runIngestExternalCmd(
 			case "synthetic-suffix":
 				nArgs(1)
 				ef.SyntheticSuffix = []byte(arg.Vals[0])
+
+			case "no-point-keys":
+				ef.HasPointKey = false
+
+			case "has-range-keys":
+				ef.HasRangeKey = true
 
 			default:
 				usageErr(fmt.Sprintf("unknown argument %v", arg.Key))

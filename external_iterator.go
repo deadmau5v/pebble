@@ -14,34 +14,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 )
 
-// ExternalIterOption provide an interface to specify open-time options to
-// NewExternalIter.
-type ExternalIterOption interface {
-	// iterApply is called on the iterator during opening in order to set internal
-	// parameters.
-	iterApply(*Iterator)
-	// readerOptions returns any reader options added by this iter option.
-	readerOptions() []sstable.ReaderOption
-}
-
-type externalIterReaderOptions struct {
-	opts []sstable.ReaderOption
-}
-
-func (e *externalIterReaderOptions) iterApply(iterator *Iterator) {
-	// Do nothing.
-}
-
-func (e *externalIterReaderOptions) readerOptions() []sstable.ReaderOption {
-	return e.opts
-}
-
-// ExternalIterReaderOptions returns an ExternalIterOption that specifies
-// sstable.ReaderOptions to be applied on sstable readers in NewExternalIter.
-func ExternalIterReaderOptions(opts ...sstable.ReaderOption) ExternalIterOption {
-	return &externalIterReaderOptions{opts: opts}
-}
-
 // NewExternalIter takes an input 2d array of sstable files which may overlap
 // across subarrays but not within a subarray (at least as far as points are
 // concerned; range keys are allowed to overlap arbitrarily even within a
@@ -59,22 +31,15 @@ func ExternalIterReaderOptions(opts ...sstable.ReaderOption) ExternalIterOption 
 // options, including block-property and table filters. NewExternalIter errors
 // if an incompatible option is set.
 func NewExternalIter(
-	o *Options,
-	iterOpts *IterOptions,
-	files [][]sstable.ReadableFile,
-	extraOpts ...ExternalIterOption,
+	o *Options, iterOpts *IterOptions, files [][]sstable.ReadableFile,
 ) (it *Iterator, err error) {
-	return NewExternalIterWithContext(context.Background(), o, iterOpts, files, extraOpts...)
+	return NewExternalIterWithContext(context.Background(), o, iterOpts, files)
 }
 
 // NewExternalIterWithContext is like NewExternalIter, and additionally
 // accepts a context for tracing.
 func NewExternalIterWithContext(
-	ctx context.Context,
-	o *Options,
-	iterOpts *IterOptions,
-	files [][]sstable.ReadableFile,
-	extraOpts ...ExternalIterOption,
+	ctx context.Context, o *Options, iterOpts *IterOptions, files [][]sstable.ReadableFile,
 ) (it *Iterator, err error) {
 	if iterOpts != nil {
 		if err := validateExternalIterOpts(iterOpts); err != nil {
@@ -85,16 +50,12 @@ func NewExternalIterWithContext(
 	var readers [][]*sstable.Reader
 
 	seqNumOffset := 0
-	var extraReaderOpts []sstable.ReaderOption
-	for i := range extraOpts {
-		extraReaderOpts = append(extraReaderOpts, extraOpts[i].readerOptions()...)
-	}
 	for _, levelFiles := range files {
 		seqNumOffset += len(levelFiles)
 	}
 	for _, levelFiles := range files {
 		seqNumOffset -= len(levelFiles)
-		subReaders, err := openExternalTables(o, levelFiles, seqNumOffset, o.MakeReaderOptions(), extraReaderOpts...)
+		subReaders, err := openExternalTables(o, levelFiles, seqNumOffset, o.MakeReaderOptions())
 		readers = append(readers, subReaders)
 		if err != nil {
 			// Close all the opened readers.
@@ -132,14 +93,11 @@ func NewExternalIterWithContext(
 			// of readers indexed by *fileMetadata.
 			panic("unreachable")
 		},
-		seqNum: base.InternalKeySeqNumMax,
+		seqNum: base.SeqNumMax,
 	}
 	if iterOpts != nil {
 		dbi.opts = *iterOpts
 		dbi.processBounds(iterOpts.LowerBound, iterOpts.UpperBound)
-	}
-	for i := range extraOpts {
-		extraOpts[i].iterApply(dbi)
 	}
 	if err := finishInitializingExternal(ctx, dbi); err != nil {
 		dbi.Close()
@@ -208,7 +166,9 @@ func createExternalPointIter(ctx context.Context, it *Iterator) (topLevelIterato
 			if err != nil {
 				return nil, err
 			}
-			rangeDelIter, err = r.NewRawRangeDelIter(transforms)
+			rangeDelIter, err = r.NewRawRangeDelIter(sstable.FragmentIterTransforms{
+				SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum),
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -220,7 +180,7 @@ func createExternalPointIter(ctx context.Context, it *Iterator) (topLevelIterato
 	}
 
 	it.alloc.merging.init(&it.opts, &it.stats.InternalStats, it.comparer.Compare, it.comparer.Split, mlevels...)
-	it.alloc.merging.snapshot = base.InternalKeySeqNumMax
+	it.alloc.merging.snapshot = base.SeqNumMax
 	if len(mlevels) <= cap(it.alloc.levelsPositioned) {
 		it.alloc.merging.levelsPositioned = it.alloc.levelsPositioned[:len(mlevels)]
 	}
@@ -255,7 +215,7 @@ func finishInitializingExternal(ctx context.Context, it *Iterator) error {
 			}
 			for _, readers := range it.externalReaders {
 				for _, r := range readers {
-					transforms := sstable.IterTransforms{SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum)}
+					transforms := sstable.FragmentIterTransforms{SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum)}
 					seqNum--
 					if rki, err := r.NewRawRangeKeyIter(transforms); err != nil {
 						return err
@@ -269,7 +229,7 @@ func finishInitializingExternal(ctx context.Context, it *Iterator) error {
 				it.rangeKey.init(it.comparer.Compare, it.comparer.Split, &it.opts)
 				it.rangeKey.rangeKeyIter = it.rangeKey.iterConfig.Init(
 					&it.comparer,
-					base.InternalKeySeqNumMax,
+					base.SeqNumMax,
 					it.opts.LowerBound, it.opts.UpperBound,
 					&it.hasPrefix, &it.prefixOrFullSeekKey,
 					false /* internalKeys */, &it.rangeKey.internal,
@@ -293,11 +253,7 @@ func finishInitializingExternal(ctx context.Context, it *Iterator) error {
 }
 
 func openExternalTables(
-	o *Options,
-	files []sstable.ReadableFile,
-	seqNumOffset int,
-	readerOpts sstable.ReaderOptions,
-	extraReaderOpts ...sstable.ReaderOption,
+	o *Options, files []sstable.ReadableFile, seqNumOffset int, readerOpts sstable.ReaderOptions,
 ) (readers []*sstable.Reader, err error) {
 	readers = make([]*sstable.Reader, 0, len(files))
 	for i := range files {
@@ -305,7 +261,7 @@ func openExternalTables(
 		if err != nil {
 			return readers, err
 		}
-		r, err := sstable.NewReader(readable, readerOpts, extraReaderOpts...)
+		r, err := sstable.NewReader(readable, readerOpts)
 		if err != nil {
 			return readers, err
 		}

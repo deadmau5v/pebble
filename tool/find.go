@@ -17,8 +17,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/wal"
@@ -438,16 +438,21 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 			}()
 
 			opts := sstable.ReaderOptions{
-				Cache:    cache,
-				Comparer: f.opts.Comparer,
-				Filters:  f.opts.Filters,
+				Comparer:  f.opts.Comparer,
+				Filters:   f.opts.Filters,
+				Comparers: f.comparers,
+				Mergers:   f.mergers,
 			}
+			opts.SetInternal(sstableinternal.ReaderOptions{
+				CacheOpts: sstableinternal.CacheOptions{
+					Cache: cache,
+				},
+			})
 			readable, err := sstable.NewSimpleReadable(tf)
 			if err != nil {
 				return err
 			}
-			r, err := sstable.NewReader(readable, opts, f.comparers, f.mergers,
-				private.SSTableRawTombstonesOpt.(sstable.ReaderOption))
+			r, err := sstable.NewReader(readable, opts)
 			if err != nil {
 				f.errors = append(f.errors, fmt.Sprintf("Unable to decode sstable %s, %s", fl.path, err.Error()))
 				// Ensure the error only gets printed once.
@@ -457,8 +462,10 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 			defer r.Close()
 
 			var transforms sstable.IterTransforms
+			var fragTransforms sstable.FragmentIterTransforms
 			if m != nil {
 				transforms = m.IterTransforms()
+				fragTransforms = m.FragmentIterTransforms()
 			}
 
 			iter, err := r.NewIter(transforms, nil, nil)
@@ -472,7 +479,7 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 			// bit more work here to put them in a form that can be iterated in
 			// parallel with the point records.
 			rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
-				iter, err := r.NewRawRangeDelIter(transforms)
+				iter, err := r.NewRawRangeDelIter(fragTransforms)
 				if err != nil {
 					return nil, err
 				}
@@ -487,7 +494,7 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 					if !t.Contains(r.Compare, searchKey) {
 						continue
 					}
-					tombstones = append(tombstones, t.ShallowClone())
+					tombstones = append(tombstones, t.Clone())
 				}
 				if err != nil {
 					return nil, err

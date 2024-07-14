@@ -4,7 +4,11 @@
 
 package sstable
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/cockroachdb/pebble/sstable/block"
+)
 
 // FilterMetrics holds metrics for the filter policy.
 type FilterMetrics struct {
@@ -28,14 +32,6 @@ type FilterMetricsTracker struct {
 	misses atomic.Int64
 }
 
-var _ ReaderOption = (*FilterMetricsTracker)(nil)
-
-func (m *FilterMetricsTracker) readerApply(r *Reader) {
-	if r.tableFilter != nil {
-		r.tableFilter.metrics = m
-	}
-}
-
 // Load returns the current values as FilterMetrics.
 func (m *FilterMetricsTracker) Load() FilterMetrics {
 	return FilterMetrics{
@@ -44,15 +40,10 @@ func (m *FilterMetricsTracker) Load() FilterMetrics {
 	}
 }
 
-// BlockHandle is the file offset and length of a block.
-type BlockHandle struct {
-	Offset, Length uint64
-}
-
 // BlockHandleWithProperties is used for data blocks and first/lower level
 // index blocks, since they can be annotated using BlockPropertyCollectors.
 type BlockHandleWithProperties struct {
-	BlockHandle
+	block.Handle
 	Props []byte
 }
 
@@ -68,10 +59,10 @@ type tableFilterReader struct {
 	metrics *FilterMetricsTracker
 }
 
-func newTableFilterReader(policy FilterPolicy) *tableFilterReader {
+func newTableFilterReader(policy FilterPolicy, metrics *FilterMetricsTracker) *tableFilterReader {
 	return &tableFilterReader{
 		policy:  policy,
-		metrics: nil,
+		metrics: metrics,
 	}
 }
 

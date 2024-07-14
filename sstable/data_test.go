@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
@@ -171,8 +172,13 @@ func runBuildCmd(
 		}
 	}
 	if cacheSize > 0 {
-		readerOpts.Cache = cache.New(int64(cacheSize))
-		defer readerOpts.Cache.Unref()
+		c := cache.New(int64(cacheSize))
+		defer c.Unref()
+		readerOpts.SetInternal(sstableinternal.ReaderOptions{
+			CacheOpts: sstableinternal.CacheOptions{
+				Cache: c,
+			},
+		})
 	}
 	r, err := NewMemReader(f0.Data(), readerOpts)
 	if err != nil {
@@ -197,14 +203,6 @@ func runBuildRawCmd(
 	}
 
 	w := NewWriter(f0, *opts)
-	for i := range td.CmdArgs {
-		arg := &td.CmdArgs[i]
-		if arg.Key == "range-del-v1" {
-			w.rangeDelV1Format = true
-			break
-		}
-	}
-
 	for _, data := range strings.Split(td.Input, "\n") {
 		if strings.HasPrefix(data, "rangekey:") {
 			data = strings.TrimPrefix(data, "rangekey:")
@@ -247,23 +245,6 @@ func runBuildRawCmd(
 		return nil, nil, err
 	}
 	return meta, r, nil
-}
-
-func scanGlobalSeqNum(td *datadriven.TestData) (uint64, error) {
-	for _, arg := range td.CmdArgs {
-		switch arg.Key {
-		case "globalSeqNum":
-			if len(arg.Vals) != 1 {
-				return 0, errors.Errorf("%s: arg %s expects 1 value", td.Cmd, arg.Key)
-			}
-			v, err := strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return 0, err
-			}
-			return uint64(v), nil
-		}
-	}
-	return 0, nil
 }
 
 type runIterCmdOption func(*runIterCmdOptions)
@@ -434,9 +415,9 @@ func runIterCmd(
 			si, _ := origIter.(*singleLevelIterator)
 			if twoLevelIter, ok := origIter.(*twoLevelIterator); ok {
 				si = &twoLevelIter.singleLevelIterator
-				if twoLevelIter.topLevelIndex.valid() {
+				if twoLevelIter.topLevelIndex.Valid() {
 					fmt.Fprintf(&b, "|  topLevelIndex.Key() = %q\n", twoLevelIter.topLevelIndex.Key())
-					v := twoLevelIter.topLevelIndex.value()
+					v := twoLevelIter.topLevelIndex.Value()
 					bhp, err := decodeBlockHandleWithProperties(v.InPlaceValue())
 					if err != nil {
 						fmt.Fprintf(&b, "|  topLevelIndex.InPlaceValue() failed to decode as BHP: %s\n", err)
@@ -447,11 +428,11 @@ func runIterCmd(
 				} else {
 					fmt.Fprintf(&b, "|  topLevelIndex iter invalid\n")
 				}
-				fmt.Fprintf(&b, "|  topLevelIndex.isDataInvalidated()=%t\n", twoLevelIter.topLevelIndex.isDataInvalidated())
+				fmt.Fprintf(&b, "|  topLevelIndex.isDataInvalidated()=%t\n", twoLevelIter.topLevelIndex.IsDataInvalidated())
 			}
-			if si.index.valid() {
+			if si.index.Valid() {
 				fmt.Fprintf(&b, "|  index.Key() = %q\n", si.index.Key())
-				v := si.index.value()
+				v := si.index.Value()
 				bhp, err := decodeBlockHandleWithProperties(v.InPlaceValue())
 				if err != nil {
 					fmt.Fprintf(&b, "|  index.InPlaceValue() failed to decode as BHP: %s\n", err)
@@ -462,8 +443,8 @@ func runIterCmd(
 			} else {
 				fmt.Fprintf(&b, "|  index iter invalid\n")
 			}
-			fmt.Fprintf(&b, "|  index.isDataInvalidated()=%t\n", si.index.isDataInvalidated())
-			fmt.Fprintf(&b, "|  data.isDataInvalidated()=%t\n", si.data.isDataInvalidated())
+			fmt.Fprintf(&b, "|  index.isDataInvalidated()=%t\n", si.index.IsDataInvalidated())
+			fmt.Fprintf(&b, "|  data.isDataInvalidated()=%t\n", si.data.IsDataInvalidated())
 			fmt.Fprintf(&b, "|  hideObsoletePoints = %t\n", si.transforms.HideObsoletePoints)
 			fmt.Fprintf(&b, "|  dataBH = (Offset: %d, Length: %d)\n", si.dataBH.Offset, si.dataBH.Length)
 			fmt.Fprintf(&b, "|  (boundsCmp,positionedUsingLatestBounds) = (%d,%t)\n", si.boundsCmp, si.positionedUsingLatestBounds)

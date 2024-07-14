@@ -772,9 +772,7 @@ func (o *ingestOp) collapseBatch(
 		if err != nil {
 			return nil, err
 		}
-		if err := rangeDelIter.Close(); err != nil {
-			return nil, err
-		}
+		rangeDelIter.Close()
 		rangeDelIter = nil
 	}
 
@@ -856,9 +854,7 @@ func (o *ingestOp) collapseBatch(
 				return nil, err
 			}
 		}
-		if err := rangeKeyIter.Close(); err != nil {
-			return nil, err
-		}
+		rangeKeyIter.Close()
 		rangeKeyIter = nil
 	}
 
@@ -1930,7 +1926,7 @@ func (r *replicateOp) runSharedReplicate(
 			}
 			return w.Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val)
 		},
-		func(start, end []byte, seqNum uint64) error {
+		func(start, end []byte, seqNum base.SeqNum) error {
 			return w.DeleteRange(start, end)
 		},
 		func(start, end []byte, keys []keyspan.Key) error {
@@ -1994,7 +1990,7 @@ func (r *replicateOp) runExternalReplicate(
 			}
 			return w.Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val)
 		},
-		func(start, end []byte, seqNum uint64) error {
+		func(start, end []byte, seqNum base.SeqNum) error {
 			return w.DeleteRange(start, end)
 		},
 		func(start, end []byte, keys []keyspan.Key) error {

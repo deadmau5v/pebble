@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/redact"
 )
 
@@ -217,6 +218,8 @@ type InternalIterator interface {
 	SetContext(ctx context.Context)
 
 	fmt.Stringer
+
+	IteratorDebug
 }
 
 // TopLevelIterator extends InternalIterator to include an additional absolute
@@ -436,17 +439,21 @@ func (s *InternalIteratorStats) String() string {
 
 // SafeFormat implements the redact.SafeFormatter interface.
 func (s *InternalIteratorStats) SafeFormat(p redact.SafePrinter, verb rune) {
-	var tombstoned humanize.FormattedString
-	if s.PointsCoveredByRangeTombstones != 0 {
-		tombstoned = "(" + humanize.Count.Uint64(s.PointsCoveredByRangeTombstones) + " tombstoned)"
-	}
-	p.Printf("blocks: %s (%s cached), read time %s; "+
-		"points: %s%s (%s keys, %s values)",
-		humanize.Bytes.Uint64(s.BlockBytes),
+	p.Printf("blocks: %s cached",
 		humanize.Bytes.Uint64(s.BlockBytesInCache),
-		humanize.FormattedString(s.BlockReadDuration.String()),
-		humanize.Count.Uint64(s.PointCount),
-		tombstoned,
+	)
+	if s.BlockBytes != s.BlockBytesInCache || s.BlockReadDuration != 0 {
+		p.Printf(", %s not cached (read time: %s)",
+			humanize.Bytes.Uint64(s.BlockBytes-s.BlockBytesInCache),
+			humanize.FormattedString(s.BlockReadDuration.String()),
+		)
+	}
+	p.Printf("; points: %s", humanize.Count.Uint64(s.PointCount))
+
+	if s.PointsCoveredByRangeTombstones != 0 {
+		p.Printf("(%s tombstoned)", humanize.Count.Uint64(s.PointsCoveredByRangeTombstones))
+	}
+	p.Printf(" (%s keys, %s values)",
 		humanize.Bytes.Uint64(s.KeyBytes),
 		humanize.Bytes.Uint64(s.ValueBytes),
 	)
@@ -456,4 +463,20 @@ func (s *InternalIteratorStats) SafeFormat(p redact.SafePrinter, verb rune) {
 			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytes),
 			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytesFetched))
 	}
+}
+
+// IteratorDebug is an interface implemented by all internal iterators and
+// fragment iterators.
+type IteratorDebug interface {
+	// DebugTree prints the entire iterator stack, used for debugging.
+	//
+	// Each implementation should perform a single Child/Childf call on tp.
+	DebugTree(tp treeprinter.Node)
+}
+
+// DebugTree returns the iterator tree as a multi-line string.
+func DebugTree(iter IteratorDebug) string {
+	tp := treeprinter.New()
+	iter.DebugTree(tp)
+	return tp.String()
 }

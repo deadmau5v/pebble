@@ -6,9 +6,12 @@ package base
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // NewDeletableSumValueMerger return a ValueMerger which computes the sum of its
@@ -68,7 +71,7 @@ func fakeIkey(s string) InternalKey {
 	if err != nil {
 		panic(err)
 	}
-	return MakeInternalKey([]byte(s[:j]), uint64(seqNum), InternalKeyKindSet)
+	return MakeInternalKey([]byte(s[:j]), SeqNum(seqNum), InternalKeyKindSet)
 }
 
 // NewFakeIter returns an iterator over the given KVs.
@@ -249,3 +252,19 @@ func (f *FakeIter) SetBounds(lower, upper []byte) {
 
 // SetContext is part of the InternalIterator interface.
 func (f *FakeIter) SetContext(_ context.Context) {}
+
+// DebugTree is part of the InternalIterator interface.
+func (f *FakeIter) DebugTree(tp treeprinter.Node) {
+	tp.Childf("%T(%p)", f, f)
+}
+
+// ParseUserKeyBounds parses UserKeyBounds from a string representation of the
+// form "[foo, bar]" or "[foo, bar)".
+func ParseUserKeyBounds(s string) UserKeyBounds {
+	first, last, s := s[0], s[len(s)-1], s[1:len(s)-1]
+	start, end, ok := strings.Cut(s, ", ")
+	if !ok || first != '[' || (last != ']' && last != ')') {
+		panic(fmt.Sprintf("invalid bounds %q", s))
+	}
+	return UserKeyBoundsEndExclusiveIf([]byte(start), []byte(end), last == ')')
+}

@@ -17,11 +17,12 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/private"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/sstable"
@@ -103,10 +104,10 @@ type tableCacheOpts struct {
 	iterCount *atomic.Int32
 
 	loggerAndTracer   LoggerAndTracer
+	cache             *cache.Cache
 	cacheID           uint64
 	objProvider       objstorage.Provider
-	opts              sstable.ReaderOptions
-	filterMetrics     *sstable.FilterMetricsTracker
+	readerOpts        sstable.ReaderOptions
 	sstStatsCollector *sstable.CategoryStatsCollector
 }
 
@@ -145,10 +146,11 @@ func newTableCacheContainer(
 	t := &tableCacheContainer{}
 	t.tableCache = tc
 	t.dbOpts.loggerAndTracer = opts.LoggerAndTracer
+	t.dbOpts.cache = opts.Cache
 	t.dbOpts.cacheID = cacheID
 	t.dbOpts.objProvider = objProvider
-	t.dbOpts.opts = opts.MakeReaderOptions()
-	t.dbOpts.filterMetrics = &sstable.FilterMetricsTracker{}
+	t.dbOpts.readerOpts = opts.MakeReaderOptions()
+	t.dbOpts.readerOpts.FilterMetricsTracker = &sstable.FilterMetricsTracker{}
 	t.dbOpts.iterCount = new(atomic.Int32)
 	t.dbOpts.sstStatsCollector = sstStatsCollector
 	return t
@@ -205,7 +207,7 @@ func (c *tableCacheContainer) metrics() (CacheMetrics, FilterMetrics) {
 		m.Misses += s.misses.Load()
 	}
 	m.Size = m.Count * int64(unsafe.Sizeof(sstable.Reader{}))
-	f := c.dbOpts.filterMetrics.Load()
+	f := c.dbOpts.readerOpts.FilterMetricsTracker.Load()
 	return m, f
 }
 
@@ -618,15 +620,15 @@ func (c *tableCacheShard) newRangeDelIter(
 ) (keyspan.FragmentIterator, error) {
 	// NB: range-del iterator does not maintain a reference to the table, nor
 	// does it need to read from it after creation.
-	rangeDelIter, err := cr.NewRawRangeDelIter(file.IterTransforms())
+	rangeDelIter, err := cr.NewRawRangeDelIter(file.FragmentIterTransforms())
 	if err != nil {
 		return nil, err
 	}
 	// Assert expected bounds in tests.
-	if invariants.Enabled && rangeDelIter != nil {
+	if invariants.Sometimes(50) && rangeDelIter != nil {
 		cmp := base.DefaultComparer.Compare
-		if dbOpts.opts.Comparer != nil {
-			cmp = dbOpts.opts.Comparer.Compare
+		if dbOpts.readerOpts.Comparer != nil {
+			cmp = dbOpts.readerOpts.Comparer.Compare
 		}
 		rangeDelIter = keyspan.AssertBounds(
 			rangeDelIter, file.SmallestPointKey, file.LargestPointKey.UserKey, cmp,
@@ -641,14 +643,14 @@ func (c *tableCacheShard) newRangeDelIter(
 func (c *tableCacheShard) newRangeKeyIter(
 	v *tableCacheValue, file *fileMetadata, cr sstable.CommonReader, opts keyspan.SpanIterOptions,
 ) (keyspan.FragmentIterator, error) {
-	transforms := file.IterTransforms()
+	transforms := file.FragmentIterTransforms()
 	// Don't filter a table's range keys if the file contains RANGEKEYDELs.
 	// The RANGEKEYDELs may delete range keys in other levels. Skipping the
 	// file's range key blocks may surface deleted range keys below. This is
 	// done here, rather than deferring to the block-property collector in order
 	// to maintain parity with point keys and the treatment of RANGEDELs.
 	if v.reader.Properties.NumRangeKeyDels == 0 && len(opts.RangeKeyFilters) > 0 {
-		ok, _, err := c.checkAndIntersectFilters(v, nil, opts.RangeKeyFilters, nil, transforms.SyntheticSuffix)
+		ok, _, err := c.checkAndIntersectFilters(v, nil, opts.RangeKeyFilters, nil, nil /* TODO(radu) transforms.SyntheticSuffix */)
 		if err != nil {
 			return nil, err
 		} else if !ok {
@@ -1011,7 +1013,7 @@ func (c *tableCacheShard) evict(fileNum base.DiskFileNum, dbOpts *tableCacheOpts
 		v.release(c)
 	}
 
-	dbOpts.opts.Cache.EvictFile(dbOpts.cacheID, fileNum)
+	dbOpts.cache.EvictFile(dbOpts.cacheID, fileNum)
 }
 
 // removeDB evicts any nodes which have a reference to the DB
@@ -1119,8 +1121,13 @@ func (v *tableCacheValue) load(loadInfo loadInfo, c *tableCacheShard, dbOpts *ta
 		context.TODO(), fileTypeTable, loadInfo.backingFileNum, objstorage.OpenOptions{MustExist: true},
 	)
 	if err == nil {
-		cacheOpts := private.SSTableCacheOpts(dbOpts.cacheID, loadInfo.backingFileNum).(sstable.ReaderOption)
-		v.reader, err = sstable.NewReader(f, dbOpts.opts, cacheOpts, dbOpts.filterMetrics)
+		o := dbOpts.readerOpts
+		o.SetInternalCacheOpts(sstableinternal.CacheOptions{
+			Cache:   dbOpts.cache,
+			CacheID: dbOpts.cacheID,
+			FileNum: loadInfo.backingFileNum,
+		})
+		v.reader, err = sstable.NewReader(f, o)
 	}
 	if err == nil {
 		var objMeta objstorage.ObjectMetadata
@@ -1270,12 +1277,15 @@ func (s *iterSet) CloseAll() error {
 	var err error
 	if s.point != nil {
 		err = s.point.Close()
+		s.point = nil
 	}
 	if s.rangeDeletion != nil {
-		err = firstError(err, s.rangeDeletion.Close())
+		s.rangeDeletion.Close()
+		s.rangeDeletion = nil
 	}
 	if s.rangeKey != nil {
-		err = firstError(err, s.rangeKey.Close())
+		s.rangeKey.Close()
+		s.rangeKey = nil
 	}
 	return err
 }

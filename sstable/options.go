@@ -5,9 +5,15 @@
 package sstable
 
 import (
+	"github.com/cockroachdb/fifo"
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/cache"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
+
+// MaximumBlockSize is the maximum permissible size of a block.
+const MaximumBlockSize = rowblk.MaximumSize
 
 // Compression is the per-block compression algorithm to use.
 type Compression int
@@ -78,12 +84,22 @@ type FilterWriter = base.FilterWriter
 // FilterPolicy exports the base.FilterPolicy type.
 type FilterPolicy = base.FilterPolicy
 
+// Comparers is a map from comparer name to comparer. It is used for debugging
+// tools which may be used on multiple databases configured with different
+// comparers.
+type Comparers map[string]*base.Comparer
+
+// Mergers is a map from merger name to merger. It is used for debugging tools
+// which may be used on multiple databases configured with different
+// mergers.
+type Mergers map[string]*base.Merger
+
 // ReaderOptions holds the parameters needed for reading an sstable.
 type ReaderOptions struct {
-	// Cache is used to cache uncompressed blocks from sstables.
-	//
-	// The default cache size is a zero-size cache.
-	Cache *cache.Cache
+	// LoadBlockSema, if set, is used to limit the number of blocks that can be
+	// loaded (i.e. read from the filesystem) in parallel. Each load acquires one
+	// unit from the semaphore for the duration of the read.
+	LoadBlockSema *fifo.Semaphore
 
 	// User properties specified in this map will not be added to sst.Properties.UserProperties.
 	DeniedUserProperties map[string]struct{}
@@ -95,31 +111,46 @@ type ReaderOptions struct {
 	// The default value uses the same ordering as bytes.Compare.
 	Comparer *Comparer
 
-	// Merge defines the Merge function in use for this keyspace.
-	Merge base.Merge
+	// Merger defines the Merge function in use for this keyspace.
+	Merger *Merger
+
+	Comparers Comparers
+	Mergers   Mergers
 
 	// Filters is a map from filter policy name to filter policy. Filters with
 	// policies that are not in this map will be ignored.
 	Filters map[string]FilterPolicy
 
-	// Merger defines the associative merge operation to use for merging values
-	// written with {Batch,DB}.Merge. The MergerName is checked for consistency
-	// with the value stored in the sstable when it was written.
-	MergerName string
-
 	// Logger is an optional logger and tracer.
 	LoggerAndTracer base.LoggerAndTracer
+
+	// FilterMetricsTracker is optionally used to track filter metrics.
+	FilterMetricsTracker *FilterMetricsTracker
+
+	// internal options can only be used from within the pebble package.
+	internal sstableinternal.ReaderOptions
+}
+
+// SetInternal sets the internal reader options. Note that even though this
+// method is public, a caller outside the pebble package can't construct a value
+// to pass to it.
+func (o *ReaderOptions) SetInternal(internalOpts sstableinternal.ReaderOptions) {
+	o.internal = internalOpts
+}
+
+// SetInternalCacheOpts sets the internal cache options. Note that even though
+// this method is public, a caller outside the pebble package can't construct a
+// value to pass to it.
+func (o *ReaderOptions) SetInternalCacheOpts(cacheOpts sstableinternal.CacheOptions) {
+	o.internal.CacheOpts = cacheOpts
 }
 
 func (o ReaderOptions) ensureDefaults() ReaderOptions {
 	if o.Comparer == nil {
 		o.Comparer = base.DefaultComparer
 	}
-	if o.Merge == nil {
-		o.Merge = base.DefaultMerger.Merge
-	}
-	if o.MergerName == "" {
-		o.MergerName = base.DefaultMerger.Name
+	if o.Merger == nil {
+		o.Merger = base.DefaultMerger
 	}
 	if o.LoggerAndTracer == nil {
 		o.LoggerAndTracer = base.NoopLoggerAndTracer{}
@@ -157,11 +188,6 @@ type WriterOptions struct {
 	//
 	// The default value is 60.
 	SizeClassAwareThreshold int
-
-	// Cache is used to cache uncompressed blocks from sstables.
-	//
-	// The default is a nil cache.
-	Cache *cache.Cache
 
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
@@ -228,7 +254,7 @@ type WriterOptions struct {
 	BlockPropertyCollectors []func() BlockPropertyCollector
 
 	// Checksum specifies which checksum to use.
-	Checksum ChecksumType
+	Checksum block.ChecksumType
 
 	// Parallelism is used to indicate that the sstable Writer is allowed to
 	// compress data blocks and write datablocks to disk in parallel with the
@@ -259,6 +285,16 @@ type WriterOptions struct {
 	// writer's flushing policy to select block sizes that preemptively reduce
 	// internal fragmentation when loaded into the block cache.
 	AllocatorSizeClasses []int
+
+	// internal options can only be used from within the pebble package.
+	internal sstableinternal.WriterOptions
+}
+
+// SetInternal sets the internal writer options. Note that even though this
+// method is public, a caller outside the pebble package can't construct a value
+// to pass to it.
+func (o *WriterOptions) SetInternal(internalOpts sstableinternal.WriterOptions) {
+	o.internal = internalOpts
 }
 
 func (o WriterOptions) ensureDefaults() WriterOptions {
@@ -286,8 +322,8 @@ func (o WriterOptions) ensureDefaults() WriterOptions {
 	if o.MergerName == "" {
 		o.MergerName = base.DefaultMerger.Name
 	}
-	if o.Checksum == ChecksumTypeNone {
-		o.Checksum = ChecksumTypeCRC32c
+	if o.Checksum == block.ChecksumTypeNone {
+		o.Checksum = block.ChecksumTypeCRC32c
 	}
 	// By default, if the table format is not specified, fall back to using the
 	// most compatible format that is supported by Pebble.
